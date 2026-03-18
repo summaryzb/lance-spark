@@ -13,14 +13,18 @@
  */
 package org.lance.spark;
 
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.File;
 import java.io.IOException;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -91,5 +95,54 @@ public abstract class BaseTestSparkDirectoryNamespace extends SparkLanceNamespac
     assertTrue(
         foundHashPrefixedDir,
         "Should find a hash-prefixed directory ending with " + expectedSuffix);
+  }
+
+  @Test
+  public void testCreateExternalTableWithLocation() throws Exception {
+    // existing data
+    String tableName = generateTableName("external_table");
+    String fullTableName = catalogName + ".default." + tableName;
+    String externalDatasetPath =
+        TestUtils.getDatasetUri(
+            TestUtils.TestTable1Config.dbPath, TestUtils.TestTable1Config.datasetName);
+    spark.sql(
+        "CREATE TABLE "
+            + fullTableName
+            + "(id INT) USING lance  LOCATION '"
+            + externalDatasetPath
+            + "'");
+
+    assertTrue(
+        catalog.tableExists(
+            org.apache.spark.sql.connector.catalog.Identifier.of(
+                new String[] {"default"}, tableName)));
+
+    Dataset<Row> result = spark.sql("SELECT * FROM " + fullTableName);
+    assertEquals(4, result.count());
+    // Verify the data is correct (from the original dataset)
+    List<Row> rows = result.collectAsList();
+    assertEquals(0, rows.get(0).getLong(0));
+    assertEquals(1, rows.get(1).getLong(0));
+    assertEquals(2, rows.get(1).getLong(1));
+
+    // none existing
+    String tableNameWithoutExisting = generateTableName("external_table");
+    String fullTableNameWithoutExisting = catalogName + ".default." + tableNameWithoutExisting;
+    Boolean createTableErr = false;
+    try {
+      spark.sql(
+          "CREATE TABLE "
+              + fullTableNameWithoutExisting
+              + "(id INT) USING lance  LOCATION '"
+              + TestUtils.TestTable1Config.dbPath
+              + "/"
+              + generateTableName("never_exist")
+              + "'");
+    } catch (Exception e) {
+      createTableErr = true;
+    }
+    assertTrue(createTableErr);
+    // none existing table shows in namespace
+    assertEquals(2, spark.sql("show tables in " + catalogName + ".default").count());
   }
 }
