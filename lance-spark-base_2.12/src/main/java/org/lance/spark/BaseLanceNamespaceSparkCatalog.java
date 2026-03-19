@@ -565,25 +565,34 @@ public abstract class BaseLanceNamespaceSparkCatalog
     // Build the table ID for credential vending
     List<String> tableIdList = buildTableId(actualIdent);
 
-    StructType processedSchema = SchemaConverter.processSchemaWithProperties(schema, properties);
-
-    // Check if location property is provided (external table)
     String location = properties.get(CREATE_TABLE_PROPERTY_LOCATION);
     boolean isExternalTable = location != null && !location.isEmpty();
 
     if (isExternalTable) {
-      // existence and schema of External table are not verified
-      // schema are provided by the lance table in location, other than definition statement
-      createExternalTable(location, properties, tableIdList);
-      try {
+      // verify external lance table exists
+      Map<String, String> merged = new HashMap<>(catalogConfig.getStorageOptions());
+      merged.putAll(properties);
+      try (Dataset dataset = openDataset(LanceSparkReadOptions.from(merged, location))) {
+        registerExternalTable(location, merged, tableIdList);
         return loadTableInternal(ident, Optional.empty(), Optional.empty());
       } catch (NoSuchTableException e) {
-        throw new RuntimeException(e);
+        throw new RuntimeException("Fail to create table on location: " + location, e);
       }
     } else {
       // Managed table: create new dataset using namespace
+      StructType processedSchema = SchemaConverter.processSchemaWithProperties(schema, properties);
       return createManagedTable(processedSchema, properties, tableIdList);
     }
+  }
+
+  /** Registers an external table in the namespace pointing to an existing dataset location. */
+  private void registerExternalTable(
+      String location, Map<String, String> properties, List<String> tableIdList) {
+    RegisterTableRequest request = new RegisterTableRequest();
+    tableIdList.forEach(request::addIdItem);
+    request.properties(properties);
+    request.location(location);
+    namespace.registerTable(request);
   }
 
   /** Creates a managed table by creating a new dataset in the namespace. */
@@ -650,16 +659,6 @@ public abstract class BaseLanceNamespaceSparkCatalog
       throw new TableAlreadyExistsException(ident);
     }
     return createDataset(readOptions, processedSchema, null, null, null);
-  }
-
-  /** Creates an external table by opening an existing dataset at the given location. */
-  private void createExternalTable(
-      String location, Map<String, String> properties, List<String> tableIdList) {
-    RegisterTableRequest request = new RegisterTableRequest();
-    tableIdList.forEach(request::addIdItem);
-    request.properties(properties);
-    request.location(location);
-    namespace.registerTable(request);
   }
 
   @Override
