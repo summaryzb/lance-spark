@@ -107,7 +107,7 @@ public abstract class BaseTestSparkDirectoryNamespace extends SparkLanceNamespac
         TestUtils.getDatasetUri(
             TestUtils.TestTable1Config.dbPath, TestUtils.TestTable1Config.datasetName);
     spark.sql(
-        "CREATE TABLE " + fullTableName + " USING lance  LOCATION '" + externalDatasetPath + "'");
+        "CREATE TABLE " + fullTableName + " USING lance LOCATION '" + externalDatasetPath + "'");
     // schema are provided by the lance table in location, other than definition statement
     assertTrue(
         catalog.tableExists(
@@ -118,9 +118,10 @@ public abstract class BaseTestSparkDirectoryNamespace extends SparkLanceNamespac
     assertEquals(4, result.count());
     // Verify the data is correct (from the original dataset)
     List<Row> rows = result.collectAsList();
-    assertEquals(0, rows.get(0).getLong(0));
-    assertEquals(1, rows.get(1).getLong(0));
-    assertEquals(2, rows.get(1).getLong(1));
+    List<List<Long>> expected = TestUtils.TestTable1Config.expectedValues;
+    assertEquals(expected.get(0).get(0), rows.get(0).getLong(0));
+    assertEquals(expected.get(1).get(0), rows.get(1).getLong(0));
+    assertEquals(expected.get(1).get(1), rows.get(1).getLong(1));
 
     // none existing
     String tableNameWithoutExisting = generateTableName("external_table");

@@ -574,9 +574,15 @@ public abstract class BaseLanceNamespaceSparkCatalog
       merged.putAll(properties);
       try (Dataset dataset = openDataset(LanceSparkReadOptions.from(merged, location))) {
         registerExternalTable(location, merged, tableIdList);
+      } catch (Exception e) {
+        throw new RuntimeException("Fail to create table on location: " + location, e);
+      }
+      try {
         return loadTableInternal(ident, Optional.empty(), Optional.empty());
       } catch (NoSuchTableException e) {
-        throw new RuntimeException("Fail to create table on location: " + location, e);
+        // ideally this should not happen
+        dropTable(ident);
+        throw new RuntimeException("Fail to load table on location: " + location, e);
       }
     } else {
       // Managed table: create new dataset using namespace
