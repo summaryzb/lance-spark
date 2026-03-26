@@ -14,6 +14,7 @@
 package org.lance.spark;
 
 import org.lance.Dataset;
+import org.lance.WriteDatasetBuilder;
 import org.lance.WriteParams;
 import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.errors.ErrorCode;
@@ -569,11 +570,13 @@ public abstract class BaseLanceNamespaceSparkCatalog
     List<String> tableIdList = buildTableId(actualIdent);
 
     StructType processedSchema = SchemaConverter.processSchemaWithProperties(schema, properties);
+    String version =
+        catalogConfig.getStorageOptions().get(LanceSparkWriteOptions.CONFIG_DATA_STORAGE_VERSION);
 
     // Create dataset using namespace - WriteDatasetBuilder handles declareTable internally
     // and properly leverages namespace client for credential vending
     String location;
-    try (Dataset dataset =
+    WriteDatasetBuilder writeBuilder =
         Dataset.write()
             .allocator(LanceRuntime.allocator())
             .namespace(namespace)
@@ -581,8 +584,11 @@ public abstract class BaseLanceNamespaceSparkCatalog
             .schema(LanceArrowUtils.toArrowSchema(processedSchema, "UTC", true))
             .mode(WriteParams.WriteMode.CREATE)
             .enableStableRowIds(catalogConfig.isEnableStableRowIds(properties))
-            .storageOptions(catalogConfig.getStorageOptions())
-            .execute()) {
+            .storageOptions(catalogConfig.getStorageOptions());
+    if (version != null) {
+      writeBuilder.dataStorageVersion(version);
+    }
+    try (Dataset dataset = writeBuilder.execute()) {
       location = dataset.uri();
     }
 
@@ -624,17 +630,21 @@ public abstract class BaseLanceNamespaceSparkCatalog
     LanceSparkReadOptions readOptions =
         createReadOptions(
             datasetUri, catalogConfig, Optional.empty(), Optional.empty(), Optional.empty(), name);
-
+    String version =
+        readOptions.getStorageOptions().get(LanceSparkWriteOptions.CONFIG_DATA_STORAGE_VERSION);
+    WriteDatasetBuilder writeBuilder =
+        Dataset.write()
+            .allocator(LanceRuntime.allocator())
+            .uri(datasetUri)
+            .schema(LanceArrowUtils.toArrowSchema(processedSchema, "UTC", true))
+            .mode(WriteParams.WriteMode.CREATE)
+            .enableStableRowIds(catalogConfig.isEnableStableRowIds(properties))
+            .storageOptions(readOptions.getStorageOptions());
+    if (version != null) {
+      writeBuilder.dataStorageVersion(version);
+    }
     try {
-      Dataset.write()
-          .allocator(LanceRuntime.allocator())
-          .uri(datasetUri)
-          .schema(LanceArrowUtils.toArrowSchema(processedSchema, "UTC", true))
-          .mode(WriteParams.WriteMode.CREATE)
-          .enableStableRowIds(catalogConfig.isEnableStableRowIds(properties))
-          .storageOptions(readOptions.getStorageOptions())
-          .execute()
-          .close();
+      writeBuilder.execute().close();
     } catch (IllegalArgumentException e) {
       throw new TableAlreadyExistsException(ident);
     }

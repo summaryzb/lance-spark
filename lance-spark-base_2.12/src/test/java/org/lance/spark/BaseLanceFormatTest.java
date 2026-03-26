@@ -22,26 +22,34 @@ import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Base test class for reading/writing Lance tables using spark.read.format("lance").load() and
  * spark.write.format("lance").save() without configuring a catalog. This verifies that the
  * DataSource works directly via path-based access (auto-registered default catalog).
+ *
+ * <p>Also tests data_storage_version configuration at catalog level. Verifies that setting
+ * data_storage_version (STABLE or LEGACY) at catalog level propagates correctly to table creation,
+ * so subsequent INSERT operations do not fail due to format mismatch.
  */
 public abstract class BaseLanceFormatTest {
   private static SparkSession spark;
@@ -49,9 +57,21 @@ public abstract class BaseLanceFormatTest {
 
   @TempDir static Path tempDir;
 
+  /**
+   * Separate temp dir for data_storage_version tests (instance-level for per-test isolation).
+   * Requires PER_METHOD lifecycle (JUnit 5 default) so each parameterized invocation gets its own
+   * directory. Do NOT switch to PER_CLASS without adjusting this field to avoid cross-test leakage.
+   */
+  @TempDir Path dsvTempDir;
+
+  /**
+   * DSV test session tracked per-test so it can be stopped in @AfterEach without affecting the
+   * shared static session used by non-DSV tests.
+   */
+  private SparkSession dsvSpark;
+
   @BeforeAll
   static void setup() {
-    // Create SparkSession WITHOUT configuring any lance catalog
     spark = SparkSession.builder().appName("lance-format-read-test").master("local").getOrCreate();
     datasetUri =
         TestUtils.getDatasetUri(
@@ -62,6 +82,17 @@ public abstract class BaseLanceFormatTest {
   static void tearDown() {
     if (spark != null) {
       spark.stop();
+    }
+  }
+
+  @AfterEach
+  void tearDownDsv() {
+    if (dsvSpark != null) {
+      dsvSpark.stop();
+      dsvSpark = null;
+      // Re-create the shared session since stop() kills the global SparkContext
+      spark =
+          SparkSession.builder().appName("lance-format-read-test").master("local").getOrCreate();
     }
   }
 
@@ -392,5 +423,104 @@ public abstract class BaseLanceFormatTest {
     assertEquals("Diana", result.get(4).getStruct(1).getString(0));
     assertEquals("Tokyo", result.get(4).getStruct(1).getStruct(1).getString(0));
     assertEquals("Japan", result.get(4).getStruct(1).getStruct(1).getString(1));
+  }
+
+  /**
+   * Tests data_storage_version propagation at catalog level. Same-version create+insert should
+   * succeed; LEGACY→STABLE upgrade succeeds; STABLE→LEGACY downgrade is rejected by lance-core.
+   */
+  @ParameterizedTest
+  @CsvSource({
+    "STABLE, STABLE, true",
+    "LEGACY, LEGACY, true",
+    "LEGACY, STABLE, true",
+    "STABLE, LEGACY, false"
+  })
+  public void testCatalogLevelDataStorageVersion(
+      String createVersion, String insertVersion, boolean expectSuccess) {
+    runDsvCrossVersionTest(createVersion, insertVersion, expectSuccess);
+  }
+
+  /**
+   * Creates a table with {@code createVersion}, then inserts data with {@code insertVersion}. When
+   * {@code expectSuccess} is true, verifies the inserted rows; otherwise asserts that the insert
+   * throws an exception.
+   */
+  private void runDsvCrossVersionTest(
+      String createVersion, String insertVersion, boolean expectSuccess) {
+    String tableName = "dsv_" + UUID.randomUUID().toString().replace("-", "");
+    String catalogCreate = dsvCatalogName("create");
+
+    // Phase 1: Create table with createVersion
+    dsvSpark = dsvSparkSession(catalogCreate, createVersion);
+    String fqnCreate = catalogCreate + ".default." + tableName;
+    dsvSpark.sql("CREATE NAMESPACE IF NOT EXISTS " + catalogCreate + ".default");
+    dsvSpark.sql(
+        String.format("CREATE TABLE %s (id INT NOT NULL, name STRING, value INT)", fqnCreate));
+
+    // Same-version: reuse the session for insert
+    if (createVersion.equals(insertVersion)) {
+      dsvSpark.sql(
+          String.format("INSERT INTO %s VALUES (1, 'Alice', 100), (2, 'Bob', 200)", fqnCreate));
+      verifyDsvRows(dsvSpark, fqnCreate);
+      return;
+    }
+
+    // Stop phase-1 session before creating phase-2 with different config
+    dsvSpark.stop();
+
+    // Phase 2: Insert with a different version
+    String catalogInsert = dsvCatalogName("insert");
+    dsvSpark = dsvSparkSession(catalogInsert, insertVersion);
+    String fqnInsert = catalogInsert + ".default." + tableName;
+    dsvSpark.sql("CREATE NAMESPACE IF NOT EXISTS " + catalogInsert + ".default");
+    String crossInsertSql =
+        String.format("INSERT INTO %s VALUES (1, 'Alice', 100), (2, 'Bob', 200)", fqnInsert);
+
+    if (expectSuccess) {
+      dsvSpark.sql(crossInsertSql);
+      verifyDsvRows(dsvSpark, fqnInsert);
+    } else {
+      SparkSession sessionRef = dsvSpark;
+      assertThrows(
+          Exception.class,
+          () -> sessionRef.sql(crossInsertSql),
+          String.format(
+              "Expected error when creating with %s and inserting with %s",
+              createVersion, insertVersion));
+    }
+  }
+
+  private void verifyDsvRows(SparkSession session, String fqn) {
+    List<Row> rows =
+        session.sql(String.format("SELECT * FROM %s ORDER BY id", fqn)).collectAsList();
+    assertEquals(2, rows.size());
+    assertEquals(1, rows.get(0).getInt(0));
+    assertEquals("Alice", rows.get(0).getString(1));
+    assertEquals(100, rows.get(0).getInt(2));
+    assertEquals(2, rows.get(1).getInt(0));
+    assertEquals("Bob", rows.get(1).getString(1));
+    assertEquals(200, rows.get(1).getInt(2));
+  }
+
+  private String dsvCatalogName(String suffix) {
+    String uid = UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+    return suffix == null ? "lance_dsv_" + uid : "lance_dsv_" + suffix + "_" + uid;
+  }
+
+  private SparkSession dsvSparkSession(String catalog, String version) {
+    SparkSession.Builder builder =
+        SparkSession.builder()
+            .appName("lance-dsv-config-test")
+            .master("local")
+            .config("spark.sql.catalog." + catalog, "org.lance.spark.LanceNamespaceSparkCatalog")
+            .config("spark.sql.catalog." + catalog + ".impl", "dir")
+            .config("spark.sql.catalog." + catalog + ".root", dsvTempDir.toString());
+
+    if (version != null) {
+      builder.config("spark.sql.catalog." + catalog + ".data_storage_version", version);
+    }
+
+    return builder.getOrCreate();
   }
 }
