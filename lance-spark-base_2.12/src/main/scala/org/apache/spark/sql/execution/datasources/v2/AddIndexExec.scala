@@ -30,7 +30,7 @@ import org.lance.spark.{BaseLanceNamespaceSparkCatalog, LanceDataset, LanceRunti
 
 import java.util.{Collections, Optional, UUID}
 
-import scala.jdk.CollectionConverters._
+import scala.collection.JavaConverters._
 
 /**
  * Physical execution of distributed CREATE INDEX (ALTER TABLE ... CREATE INDEX ...) for Lance datasets.
@@ -156,13 +156,23 @@ case class AddIndexExec(
         .fragments(fragmentIds.asJava)
         .build()
 
-      val op = AddIndexOperation.builder().withNewIndices(Collections.singletonList(index)).build()
+      // Find existing indices with the same name to mark as removed (for replace)
+      val removedIndices = dataset.getIndexes.asScala
+        .filter(_.name() == indexName)
+        .toList.asJava
+
+      val op = AddIndexOperation.builder()
+        .withNewIndices(Collections.singletonList(index))
+        .withRemovedIndices(removedIndices)
+        .build()
       val txn = new Transaction.Builder()
         .readVersion(dataset.version())
         .operation(op)
         .build()
       try {
-        val newDataset = new CommitBuilder(dataset).execute(txn)
+        val newDataset = new CommitBuilder(dataset)
+          .writeParams(readOptions.getStorageOptions)
+          .execute(txn)
         newDataset.close()
       } finally {
         txn.close()
