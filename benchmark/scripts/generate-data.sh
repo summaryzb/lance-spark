@@ -45,7 +45,7 @@ echo "Data dir:        ${DATA_DIR}"
 echo ""
 
 # Step 1: Build benchmark jar if needed
-BENCHMARK_JAR="${BENCHMARK_DIR}/target/lance-spark-benchmark-0.3.0-beta.1.jar"
+BENCHMARK_JAR="${BENCHMARK_DIR}/target/lance-spark-benchmark-0.3.0-beta.3.jar"
 if [ ! -f "${BENCHMARK_JAR}" ]; then
   echo "--- Building benchmark jar ---"
   cd "${BENCHMARK_DIR}"

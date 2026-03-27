@@ -4,14 +4,14 @@
 
     <groupId>org.lance</groupId>
     <artifactId>lance-spark-benchmark</artifactId>
-    <version>0.3.0-beta.1</version>
+    <version>0.3.0-beta.3</version>
     <packaging>jar</packaging>
 
     <name>Lance Spark TPC-DS Benchmark</name>
     <description>TPC-DS benchmark for Lance Spark connector</description>
 
     <properties>
-        <lance-spark.version>0.3.0-beta.1</lance-spark.version>
+        <lance-spark.version>0.3.0-beta.3</lance-spark.version>
         <spark.version>3.5.5</spark.version>
         <spark.compat.version>3.5</spark.compat.version>
         <scala.compat.version>2.12</scala.compat.version>
