@@ -11,13 +11,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# TPC-DS data generation via Spark (using Kyuubi TPC-DS connector).
+# Create btree indexes on TPC-DS dimension tables for zonemap-based
+# fragment pruning and storage-partitioned join (SPJ) support.
 #
-# Generates TPC-DS tables in parallel across Spark executors and writes
-# them directly into the target format(s) — no intermediate files.
+# Run this after generate-data.sh and before run-benchmark.sh.
 #
 # Usage:
-#   ./generate-data.sh [SCALE_FACTOR] [FORMATS] [SPARK_MASTER]
+#   ./create-indexes.sh [SPARK_MASTER]
 
 set -euo pipefail
 
@@ -28,29 +28,16 @@ BENCHMARK_DIR="${SCRIPT_DIR}/.."
 SPARK_VERSION="${SPARK_VERSION:-3.5}"
 SCALA_VERSION="${SCALA_VERSION:-2.12}"
 
-SCALE_FACTOR="${1:-1}"
-FORMATS="${2:-parquet,lance}"
-SPARK_MASTER="${3:-local[*]}"
+SPARK_MASTER="${1:-local[*]}"
 
 # Object store / external paths — default to local when unset
 DATA_DIR="${DATA_DIR:-${BENCHMARK_DIR}/data}"
 
-echo "=== TPC-DS Data Generation ==="
-echo "Scale factor:    ${SCALE_FACTOR}"
-echo "Formats:         ${FORMATS}"
+echo "=== TPC-DS Index Creation ==="
 echo "Spark master:    ${SPARK_MASTER}"
 echo "Spark version:   ${SPARK_VERSION}"
 echo "Scala version:   ${SCALA_VERSION}"
 echo "Data dir:        ${DATA_DIR}"
-if [ -n "${FILE_FORMAT_VERSION:-}" ]; then
-  echo "File format version: ${FILE_FORMAT_VERSION}"
-fi
-if [ -n "${MAX_BYTES_PER_FILE:-}" ]; then
-  echo "Max bytes/file:  ${MAX_BYTES_PER_FILE}"
-fi
-if [ -n "${MAX_ROWS_PER_FILE:-}" ]; then
-  echo "Max rows/file:   ${MAX_ROWS_PER_FILE}"
-fi
 echo ""
 
 # Step 1: Build benchmark jar if needed
@@ -74,26 +61,22 @@ if [ -z "${BUNDLE_JAR}" ]; then
   cd "${SCRIPT_DIR}"
 fi
 
-# Step 3: Generate data via spark-submit
+# Step 3: Create indexes via spark-submit
 SPARK_SUBMIT="spark-submit"
 if [ -n "${SPARK_HOME:-}" ]; then
   SPARK_SUBMIT="${SPARK_HOME}/bin/spark-submit"
 fi
-
+echo "BUNDLE_JAR ${BUNDLE_JAR}"
 ${SPARK_SUBMIT} \
-  --class org.lance.spark.benchmark.TpcdsDataGenerator \
+  --class org.lance.spark.benchmark.TpcdsIndexBuilder \
   --master "${SPARK_MASTER}" \
   --driver-memory "${DRIVER_MEMORY:-4g}" \
   --executor-memory "${EXECUTOR_MEMORY:-4g}" \
   --jars "${BUNDLE_JAR}" \
   --conf spark.sql.extensions=org.lance.spark.extensions.LanceSparkSessionExtensions \
   --conf spark.driver.extraJavaOptions="-XX:+IgnoreUnrecognizedVMOptions --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED -Dio.netty.tryReflectionSetAccessible=true" \
-  ${MAX_BYTES_PER_FILE:+ --conf spark.sql.catalog.lance_default.max_bytes_per_file="${MAX_BYTES_PER_FILE}"} \
-  ${MAX_ROWS_PER_FILE:+ --conf spark.sql.catalog.lance_default.max_row_per_file="${MAX_ROWS_PER_FILE}"} \
   "${BENCHMARK_JAR}" \
-  --data-dir "${DATA_DIR}" \
-  --scale-factor "${SCALE_FACTOR}" \
-  --formats "${FORMATS}"${FILE_FORMAT_VERSION:+ --file-format-version "${FILE_FORMAT_VERSION}"}
+  --data-dir "${DATA_DIR}"
 
 echo ""
-echo "=== Data generation complete ==="
+echo "=== Index creation complete ==="
