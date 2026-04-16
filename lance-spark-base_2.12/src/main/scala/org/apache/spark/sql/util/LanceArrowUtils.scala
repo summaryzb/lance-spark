@@ -101,6 +101,9 @@ object LanceArrowUtils {
           case DateUnit.DAY => DateType
           case DateUnit.MILLISECOND => DateType
         }
+      case ts: ArrowType.Timestamp =>
+        if (ts.getTimezone != null && ts.getTimezone.nonEmpty) TimestampType
+        else TimestampNTZType
       case l: ArrowType.List =>
         val children = field.getChildren
         if (children.isEmpty) {
