@@ -41,9 +41,7 @@ import org.apache.spark.sql.connector.read.SupportsPushDownOffset;
 import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.connector.read.SupportsPushDownTopN;
 import org.apache.spark.sql.sources.Filter;
-import org.apache.spark.sql.types.ArrayType;
 import org.apache.spark.sql.types.DataTypes;
-import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -237,20 +235,6 @@ public class LanceScanBuilder
   @Override
   public Filter[] pushFilters(Filter[] filters) {
     if (!readOptions.isPushDownFilters()) {
-      return filters;
-    }
-    // remove the code after fix this issue https://github.com/lance-format/lance/issues/3578
-    boolean hasNestedField = false;
-    for (StructField field : this.schema.fields()) {
-      if (field.dataType() instanceof ArrayType) {
-        ArrayType fieldType = (ArrayType) field.dataType();
-        if (fieldType.elementType() instanceof StructType) {
-          hasNestedField = true;
-          break;
-        }
-      }
-    }
-    if (hasNestedField) {
       return filters;
     }
     Filter[][] processFilters = FilterPushDown.processFilters(filters);
