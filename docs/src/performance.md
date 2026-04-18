@@ -72,6 +72,33 @@ df.write \
     .saveAsTable("my_table")
 ```
 
+### Max Batch Bytes
+
+Set via Spark write option `max_batch_bytes` (default: 268435456, i.e. 256MB).
+
+Controls the maximum in-memory size of each Arrow batch before it is flushed.
+Batches are flushed when either the row count reaches `batch_size` or the allocated memory
+reaches `max_batch_bytes`, whichever comes first.
+
+This prevents OOM when writing tables with very large rows — wide schemas, large binary/string
+columns, or high-dimensional vector embeddings — where even a modest number of rows can exhaust
+memory before the row-count threshold is reached.
+
+Small-row workloads are unaffected because the row-count limit is hit first.
+
+!!!note
+      When using the queued write buffer, total in-flight Arrow memory can be roughly
+      `queue_depth * max_batch_bytes`. You may need to tune `queue_depth` and `max_batch_bytes`
+      together to stay within memory limits.
+
+```python
+df.write \
+    .format("lance") \
+    .option("max_batch_bytes", "134217728") \
+    .mode("append") \
+    .saveAsTable("my_table")  # 128MB per batch
+```
+
 ### Max Rows Per File
 
 Set via Spark write option `max_row_per_file` (default: 1,000,000).

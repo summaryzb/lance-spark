@@ -1,6 +1,6 @@
 # Contributing to Spark Lance Connector
 
-The Spark Lance connector codebase is at [lancedb/lance-spark](https://github.com/lance-format/lance-spark).
+The Spark Lance connector codebase is at [lance-format/lance-spark](https://github.com/lance-format/lance-spark).
 
 ## Build Commands
 
