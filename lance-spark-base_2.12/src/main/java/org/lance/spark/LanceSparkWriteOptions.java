@@ -56,6 +56,7 @@ public class LanceSparkWriteOptions implements Serializable {
   public static final String CONFIG_BATCH_SIZE = "batch_size";
   public static final String CONFIG_ENABLE_STABLE_ROW_IDS = "enable_stable_row_ids";
   public static final String CONFIG_USE_LARGE_VAR_TYPES = "use_large_var_types";
+  public static final String CONFIG_MAX_BATCH_BYTES = "max_batch_bytes";
 
   private static final WriteMode DEFAULT_WRITE_MODE = WriteMode.APPEND;
   private static final boolean DEFAULT_USE_QUEUED_WRITE_BUFFER = false;
@@ -63,6 +64,9 @@ public class LanceSparkWriteOptions implements Serializable {
   // Changed from 512 to 8192 for better write performance consistency with read path
   private static final int DEFAULT_BATCH_SIZE = 8192;
   private static final boolean DEFAULT_USE_LARGE_VAR_TYPES = false;
+  // Default max bytes per batch (256MB). Batches flush when either row count or byte size
+  // is reached, whichever comes first. This prevents OOM when rows are very large.
+  public static final long DEFAULT_MAX_BATCH_BYTES = 256L * 1024 * 1024;
 
   private final String datasetUri;
   private final WriteMode writeMode;
@@ -77,6 +81,7 @@ public class LanceSparkWriteOptions implements Serializable {
   // inherits from the manifest (e.g. append without re-specifying). Staged commit uses primitives.
   private final Boolean enableStableRowIds;
   private final boolean useLargeVarTypes;
+  private final long maxBatchBytes;
   private final Map<String, String> storageOptions;
 
   /** The namespace for credential vending. Transient as LanceNamespace is not serializable. */
@@ -100,6 +105,7 @@ public class LanceSparkWriteOptions implements Serializable {
     this.batchSize = builder.batchSize;
     this.enableStableRowIds = builder.enableStableRowIds;
     this.useLargeVarTypes = builder.useLargeVarTypes;
+    this.maxBatchBytes = builder.maxBatchBytes;
     this.storageOptions = new HashMap<>(builder.storageOptions);
     this.namespace = builder.namespace;
     this.tableId = builder.tableId;
@@ -179,6 +185,10 @@ public class LanceSparkWriteOptions implements Serializable {
     return useLargeVarTypes;
   }
 
+  public long getMaxBatchBytes() {
+    return maxBatchBytes;
+  }
+
   public Map<String, String> getStorageOptions() {
     return storageOptions;
   }
@@ -207,6 +217,9 @@ public class LanceSparkWriteOptions implements Serializable {
         .useQueuedWriteBuffer(useQueuedWriteBuffer)
         .queueDepth(queueDepth)
         .batchSize(batchSize)
+        .maxBatchBytes(maxBatchBytes)
+        .enableStableRowIds(enableStableRowIds)
+        .useLargeVarTypes(useLargeVarTypes)
         .storageOptions(storageOptions)
         .namespace(namespace)
         .tableId(tableId)
@@ -288,6 +301,7 @@ public class LanceSparkWriteOptions implements Serializable {
         && queueDepth == that.queueDepth
         && batchSize == that.batchSize
         && useLargeVarTypes == that.useLargeVarTypes
+        && maxBatchBytes == that.maxBatchBytes
         && Objects.equals(datasetUri, that.datasetUri)
         && writeMode == that.writeMode
         && Objects.equals(maxRowsPerFile, that.maxRowsPerFile)
@@ -314,6 +328,7 @@ public class LanceSparkWriteOptions implements Serializable {
         batchSize,
         enableStableRowIds,
         useLargeVarTypes,
+        maxBatchBytes,
         storageOptions,
         tableId,
         version);
@@ -332,6 +347,7 @@ public class LanceSparkWriteOptions implements Serializable {
     private int batchSize = DEFAULT_BATCH_SIZE;
     private Boolean enableStableRowIds;
     private boolean useLargeVarTypes = DEFAULT_USE_LARGE_VAR_TYPES;
+    private long maxBatchBytes = DEFAULT_MAX_BATCH_BYTES;
     private Map<String, String> storageOptions = new HashMap<>();
     private LanceNamespace namespace;
     private List<String> tableId;
@@ -391,6 +407,12 @@ public class LanceSparkWriteOptions implements Serializable {
 
     public Builder useLargeVarTypes(boolean useLargeVarTypes) {
       this.useLargeVarTypes = useLargeVarTypes;
+      return this;
+    }
+
+    public Builder maxBatchBytes(long maxBatchBytes) {
+      Preconditions.checkArgument(maxBatchBytes > 0, "maxBatchBytes must be positive");
+      this.maxBatchBytes = maxBatchBytes;
       return this;
     }
 
@@ -455,6 +477,11 @@ public class LanceSparkWriteOptions implements Serializable {
       }
       if (options.containsKey(CONFIG_USE_LARGE_VAR_TYPES)) {
         this.useLargeVarTypes = Boolean.parseBoolean(options.get(CONFIG_USE_LARGE_VAR_TYPES));
+      }
+      if (options.containsKey(CONFIG_MAX_BATCH_BYTES)) {
+        long parsedMaxBatchBytes = Long.parseLong(options.get(CONFIG_MAX_BATCH_BYTES));
+        Preconditions.checkArgument(parsedMaxBatchBytes > 0, "max_batch_bytes must be positive");
+        this.maxBatchBytes = parsedMaxBatchBytes;
       }
       return this;
     }
