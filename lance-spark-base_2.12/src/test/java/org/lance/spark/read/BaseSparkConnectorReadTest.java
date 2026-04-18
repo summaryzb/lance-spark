@@ -546,14 +546,7 @@ public abstract class BaseSparkConnectorReadTest {
     assertEquals(3, arr.size());
   }
 
-  /**
-   * Regression test for upstream lance#3578: filter pushdown with deeply nested struct >
-   * list&lt;struct&gt; > struct schema. The bug caused inner fields of nested structs to be dropped
-   * when a filter was applied on a sibling top-level column.
-   *
-   * <p>Schema mirrors the original issue: item: string, sub_obj: struct&lt;second_sub_obj:
-   * array&lt;struct&lt;str_val: string, third_sub_obj: struct&lt;int_val: int&gt;&gt;&gt;&gt;
-   */
+  /** Test filter pushdown with deeply nested struct > list&lt;struct&gt; > struct schema. */
   @Test
   public void testFilterWithArrayOfStructColumn() {
     // third_sub_obj: struct<int_val: int>
@@ -604,19 +597,18 @@ public abstract class BaseSparkConnectorReadTest {
     Dataset<Row> lanceData = spark.read().format(LanceDataSource.name).load(datasetPath);
     assertEquals(3, lanceData.count());
 
-    // Read with filter on top-level "item" column (the lance#3578 trigger)
+    // Read with filter on top-level "item" column
     List<Row> filtered = lanceData.filter("item = 'test'").collectAsList();
     assertEquals(2, filtered.size());
 
     // Verify nested struct fields are NOT dropped after filter pushdown.
-    // lance#3578 caused str_val to disappear from the returned schema.
     for (Row row : filtered) {
       assertEquals("test", row.getString(0));
       Row subObjRow = row.getStruct(1);
       scala.collection.Seq<?> arr = (scala.collection.Seq<?>) subObjRow.get(0);
       assertTrue(arr.size() > 0, "second_sub_obj array should not be empty");
       Row element = (Row) arr.apply(0);
-      // str_val must be present and non-null (lance#3578 dropped this field)
+      // str_val must be present and non-null
       assertFalse(element.isNullAt(0), "str_val should not be null");
       assertTrue(
           element.getString(0).startsWith("val"),

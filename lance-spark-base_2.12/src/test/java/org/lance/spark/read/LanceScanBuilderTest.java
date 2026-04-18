@@ -132,8 +132,7 @@ public class LanceScanBuilderTest {
 
   @Test
   public void testPushFiltersWithNestedArrayOfStruct() {
-    // lance#3578 has been fixed upstream in lance-core (PR #4838).
-    // Filters on non-Array<Struct> columns should now be pushed down normally.
+    // Filters on non-Array<Struct> columns should be pushed down normally.
     StructType nestedSchema =
         new StructType(
             new StructField[] {
@@ -156,7 +155,6 @@ public class LanceScanBuilderTest {
             null,
             Collections.emptyMap(),
             Collections.emptyMap());
-    // Previously this was blocked by the workaround; now it pushes down normally
     Filter[] filters = new Filter[] {new GreaterThan("id", 1L)};
     Filter[] result = builder.pushFilters(filters);
     assertEquals(0, result.length);
