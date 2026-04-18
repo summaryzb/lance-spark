@@ -47,6 +47,8 @@ import java.io.ByteArrayOutputStream;
 import java.nio.file.Path;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.Arrays;
 import java.util.List;
 
@@ -300,14 +302,12 @@ public abstract class BaseTimestampUnitReadTest {
 
     assertEquals(2, rows.size());
     // TimestampNTZ values surface as LocalDateTime via getAs
-    java.time.LocalDateTime expected1 =
-        java.time.LocalDateTime.ofInstant(
-            Instant.ofEpochMilli(TS1_MILLIS), java.time.ZoneOffset.UTC);
-    java.time.LocalDateTime expected2 =
-        java.time.LocalDateTime.ofInstant(
-            Instant.ofEpochMilli(TS2_MILLIS), java.time.ZoneOffset.UTC);
-    assertEquals(expected1, rows.get(0).<java.time.LocalDateTime>getAs(1));
-    assertEquals(expected2, rows.get(1).<java.time.LocalDateTime>getAs(1));
+    LocalDateTime expected1 =
+        LocalDateTime.ofInstant(Instant.ofEpochMilli(TS1_MILLIS), ZoneOffset.UTC);
+    LocalDateTime expected2 =
+        LocalDateTime.ofInstant(Instant.ofEpochMilli(TS2_MILLIS), ZoneOffset.UTC);
+    assertEquals(expected1, rows.get(0).<LocalDateTime>getAs(1));
+    assertEquals(expected2, rows.get(1).<LocalDateTime>getAs(1));
   }
 
   // ---- Null handling ----
