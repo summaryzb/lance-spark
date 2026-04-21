@@ -31,7 +31,7 @@ import org.apache.spark.sql.types._
 import org.json4s.{DefaultFormats, Formats}
 import org.json4s.JsonAST.{JObject, JString}
 import org.lance.spark.LanceConstant
-import org.lance.spark.utils.{BlobUtils, Float16Utils, LargeVarCharUtils, VectorUtils}
+import org.lance.spark.utils.{BlobUtils, DateMilliUtils, Float16Utils, LargeVarCharUtils, VectorUtils}
 
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
@@ -43,6 +43,7 @@ object LanceArrowUtils {
   val ARROW_FLOAT16_KEY = Float16Utils.ARROW_FLOAT16_KEY
   val ENCODING_BLOB = BlobUtils.LANCE_ENCODING_BLOB_KEY
   val ARROW_LARGE_VAR_CHAR_KEY = LargeVarCharUtils.ARROW_LARGE_VAR_CHAR_KEY
+  val ARROW_DATE_MILLISECOND_KEY = DateMilliUtils.ARROW_DATE_MILLISECOND_KEY
 
   def fromArrowField(field: Field): DataType = {
     field.getType match {
@@ -78,7 +79,18 @@ object LanceArrowUtils {
               LongType
             case _ => fromArrowField(childField)
           }
-          StructField(childField.getName, childType, childField.isNullable)
+          val baseMeta = Metadata.fromJObject(
+            JObject(childField.getMetadata.asScala
+              .map { case (k, v) => (k, JString(v)) }.toList))
+          val childMeta = childField.getType match {
+            case d: ArrowType.Date if d.getUnit == DateUnit.MILLISECOND =>
+              new MetadataBuilder()
+                .withMetadata(baseMeta)
+                .putString(ARROW_DATE_MILLISECOND_KEY, DateMilliUtils.ARROW_DATE_MILLISECOND_VALUE)
+                .build()
+            case _ => baseMeta
+          }
+          StructField(childField.getName, childType, childField.isNullable, childMeta)
         }.toArray
         StructType(fields)
       case largeBinary: ArrowType.LargeBinary if isBlobField(field) =>
@@ -104,6 +116,9 @@ object LanceArrowUtils {
       case ts: ArrowType.Timestamp =>
         if (ts.getTimezone != null && ts.getTimezone.nonEmpty) TimestampType
         else TimestampNTZType
+      // TODO: Date(MILLISECOND), FixedSizeList, and LargeUtf8 metadata is lost for array
+      // elements because fromArrowField returns DataType without metadata. Track as a
+      // known limitation; address in a follow-up.
       case l: ArrowType.List =>
         val children = field.getChildren
         if (children.isEmpty) {
@@ -113,6 +128,8 @@ object LanceArrowUtils {
         val elementType = fromArrowField(elementField)
         val containsNull = elementField.isNullable
         ArrayType(elementType, containsNull)
+      // TODO: Same metadata limitation as List — Date(MILLISECOND) and other
+      // metadata-carrying types lose metadata for map key/value types.
       case _: ArrowType.Map =>
         // Keep map conversion recursive to avoid delegating nested unsupported Arrow types
         // back to Spark ArrowUtils.
@@ -156,6 +173,14 @@ object LanceArrowUtils {
           // Preserve LargeUtf8 type info so subsequent writes use LargeVarCharVector
           new MetadataBuilder()
             .putString(ARROW_LARGE_VAR_CHAR_KEY, "true")
+            .build()
+        case date: ArrowType.Date if date.getUnit == DateUnit.MILLISECOND =>
+          val base = Metadata.fromJObject(
+            JObject(field.getMetadata.asScala
+              .map { case (k, v) => (k, JString(v)) }.toList))
+          new MetadataBuilder()
+            .withMetadata(base)
+            .putString(ARROW_DATE_MILLISECOND_KEY, DateMilliUtils.ARROW_DATE_MILLISECOND_VALUE)
             .build()
         case _ => Metadata.fromJObject(
             JObject(field.getMetadata.asScala.map { case (k, v) => (k, JString(v)) }.toList))
@@ -289,6 +314,13 @@ object LanceArrowUtils {
             largeVarTypes = largeVarTypes)).asJava)
       case udt: UserDefinedType[_] =>
         toArrowField(name, udt.sqlType, nullable, timeZoneId, largeVarTypes = largeVarTypes)
+      case DateType if DateMilliUtils.hasDateMilliMetadata(metadata) =>
+        val fieldType = new FieldType(
+          nullable,
+          new ArrowType.Date(DateUnit.MILLISECOND),
+          null,
+          meta.asJava)
+        new Field(name, fieldType, Seq.empty[Field].asJava)
       case dataType =>
         val fieldType =
           new FieldType(nullable, toArrowType(dataType, timeZoneId, large, name), null, meta.asJava)
