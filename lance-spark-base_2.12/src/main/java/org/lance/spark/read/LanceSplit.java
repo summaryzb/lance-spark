@@ -38,7 +38,10 @@ public class LanceSplit implements Serializable {
     return fragments;
   }
 
-  /** Result of scan planning containing splits, resolved version, and per-fragment row counts. */
+  /**
+   * Result of scan planning containing splits, resolved version, per-fragment row counts, and
+   * per-fragment byte sizes.
+   */
   public static class ScanPlanResult {
     private final List<LanceSplit> splits;
     private final long resolvedVersion;
@@ -46,11 +49,18 @@ public class LanceSplit implements Serializable {
     /** Per-fragment logical row counts (after deletions). Key is fragment ID. */
     private final Map<Integer, Long> fragmentRowCounts;
 
+    /** Per-fragment byte sizes summed across all data files. Key is fragment ID. */
+    private final Map<Integer, Long> fragmentByteSizes;
+
     public ScanPlanResult(
-        List<LanceSplit> splits, long resolvedVersion, Map<Integer, Long> fragmentRowCounts) {
+        List<LanceSplit> splits,
+        long resolvedVersion,
+        Map<Integer, Long> fragmentRowCounts,
+        Map<Integer, Long> fragmentByteSizes) {
       this.splits = splits;
       this.resolvedVersion = resolvedVersion;
       this.fragmentRowCounts = fragmentRowCounts;
+      this.fragmentByteSizes = fragmentByteSizes;
     }
 
     public List<LanceSplit> getSplits() {
@@ -64,27 +74,42 @@ public class LanceSplit implements Serializable {
     public Map<Integer, Long> getFragmentRowCounts() {
       return fragmentRowCounts;
     }
+
+    public Map<Integer, Long> getFragmentByteSizes() {
+      return fragmentByteSizes;
+    }
   }
 
   /**
    * Generates splits and resolves the dataset version.
    *
    * <p>This method opens the dataset at the specified version (or latest if not specified), gets
-   * the fragment IDs and per-fragment row counts, and returns both the splits and the resolved
-   * version. The resolved version should be passed to workers to ensure snapshot isolation.
+   * the fragment IDs, per-fragment row counts, and per-fragment byte sizes, and returns them along
+   * with the resolved version. The resolved version should be passed to workers to ensure snapshot
+   * isolation.
+   *
+   * <p>The per-fragment byte size is computed by summing {@code getFileSizeBytes()} over every data
+   * file in the fragment's manifest. {@link LanceFragmentPacker} uses these values to bin-pack
+   * small fragments into larger Spark partitions.
    */
   public static ScanPlanResult planScan(LanceSparkReadOptions readOptions) {
     try (Dataset dataset = Utils.openDatasetBuilder(readOptions).build()) {
       List<Fragment> fragments = dataset.getFragments();
       List<LanceSplit> splits = new ArrayList<>(fragments.size());
       Map<Integer, Long> fragmentRowCounts = new HashMap<>(fragments.size());
+      Map<Integer, Long> fragmentByteSizes = new HashMap<>(fragments.size());
       for (Fragment fragment : fragments) {
         int id = fragment.getId();
         splits.add(new LanceSplit(Collections.singletonList(id)));
         fragmentRowCounts.put(id, fragment.metadata().getNumRows());
+        long bytes =
+            fragment.metadata().getFiles().stream()
+                .mapToLong(f -> f.getFileSizeBytes() == null ? 0L : f.getFileSizeBytes())
+                .sum();
+        fragmentByteSizes.put(id, bytes);
       }
       long resolvedVersion = dataset.getVersion().getId();
-      return new ScanPlanResult(splits, resolvedVersion, fragmentRowCounts);
+      return new ScanPlanResult(splits, resolvedVersion, fragmentRowCounts, fragmentByteSizes);
     }
   }
 

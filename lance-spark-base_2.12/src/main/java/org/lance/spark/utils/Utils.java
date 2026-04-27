@@ -21,7 +21,9 @@ import org.lance.spark.LanceRuntime;
 import org.lance.spark.LanceSparkCatalogConfig;
 import org.lance.spark.LanceSparkReadOptions;
 import org.lance.spark.LanceSparkWriteOptions;
+import org.lance.spark.internal.LanceManifestCache;
 
+import java.nio.ByteBuffer;
 import java.time.Instant;
 import java.util.Collections;
 import java.util.List;
@@ -143,32 +145,48 @@ public class Utils {
         roBuilder.setMetadataCacheSize(metadataCacheSize);
       }
 
-      if (namespace != null && tableId != null) {
-        return Dataset.open()
-            .allocator(LanceRuntime.allocator())
-            .namespaceClient(namespace)
-            .tableId(tableId)
-            .readOptions(roBuilder.build())
-            .build();
+      // Cache only when (uri, version) are both pinned and we are on the uri-path.
+      boolean cacheable = version != null && uri != null && !(namespace != null && tableId != null);
+      byte[] cached = cacheable ? LanceManifestCache.getIfPresent(uri, version) : null;
+      if (cached != null) {
+        // lance-core's native openNative() requires a direct ByteBuffer
+        // (heap-wrapped buffers NPE in get_direct_buffer_address).
+        ByteBuffer direct = ByteBuffer.allocateDirect(cached.length);
+        direct.put(cached).flip();
+        roBuilder.setSerializedManifest(direct);
       }
+      Dataset ds;
       if (runtimeNamespaceImpl != null) {
         LanceNamespace runtimeNamespace =
             LanceRuntime.getOrCreateNamespace(runtimeNamespaceImpl, runtimeNamespaceProperties);
         List<String> effectiveTableId = runtimeTableId != null ? runtimeTableId : tableId;
         if (runtimeNamespace != null && effectiveTableId != null) {
-          return Dataset.open()
-              .allocator(LanceRuntime.allocator())
-              .namespaceClient(runtimeNamespace)
-              .tableId(effectiveTableId)
-              .readOptions(roBuilder.build())
-              .build();
+          ds =
+              Dataset.open()
+                  .allocator(LanceRuntime.allocator())
+                  .namespaceClient(runtimeNamespace)
+                  .tableId(effectiveTableId)
+                  .readOptions(roBuilder.build())
+                  .build();
         }
       }
-      return Dataset.open()
-          .allocator(LanceRuntime.allocator())
-          .uri(uri)
-          .readOptions(roBuilder.build())
-          .build();
+      ds =
+          Dataset.open()
+              .allocator(LanceRuntime.allocator())
+              .uri(uri)
+              .readOptions(roBuilder.build())
+              .build();
+      if (cacheable && cached == null) {
+        try {
+          byte[] manifestBytes = ds.getSerializedManifest();
+          if (manifestBytes != null && manifestBytes.length > 0) {
+            LanceManifestCache.put(uri, version, manifestBytes);
+          }
+        } catch (Throwable ignored) {
+          // Silent degradation: cache-fill failure must not affect the opened Dataset.
+        }
+      }
+      return ds;
     }
   }
 

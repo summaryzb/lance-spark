@@ -40,21 +40,52 @@ public class LanceFragmentScanner implements AutoCloseable {
   private final boolean withFragemtId;
   private final LanceInputPartition inputPartition;
 
+  /**
+   * When true, {@link #dataset} is owned externally by the caller (e.g. a per-partition reader that
+   * shares a single dataset across many fragments). {@link #close()} will NOT close it.
+   */
+  private final boolean datasetExternallyOwned;
+
   private LanceFragmentScanner(
       Dataset dataset,
       LanceScanner scanner,
       int fragmentId,
       boolean withFragmentId,
-      LanceInputPartition inputPartition) {
+      LanceInputPartition inputPartition,
+      boolean datasetExternallyOwned) {
     this.dataset = dataset;
     this.scanner = scanner;
     this.fragmentId = fragmentId;
     this.withFragemtId = withFragmentId;
     this.inputPartition = inputPartition;
+    this.datasetExternallyOwned = datasetExternallyOwned;
   }
 
   public static LanceFragmentScanner create(int fragmentId, LanceInputPartition inputPartition) {
-    Dataset dataset = null;
+    return createInternal(fragmentId, inputPartition, null);
+  }
+
+  /**
+   * Variant that reuses a dataset opened by the caller. The returned scanner will NOT close the
+   * dataset when {@link #close()} is invoked; lifecycle responsibility stays with the caller.
+   *
+   * <p>Used by {@link org.lance.spark.read.LanceColumnarPartitionReader} when one partition packs
+   * multiple fragments — avoids re-opening the dataset per fragment.
+   */
+  public static LanceFragmentScanner create(
+      int fragmentId, LanceInputPartition inputPartition, Dataset sharedDataset) {
+    if (sharedDataset == null) {
+      return createInternal(fragmentId, inputPartition, null);
+    }
+    return createInternal(fragmentId, inputPartition, sharedDataset);
+  }
+
+  private static LanceFragmentScanner createInternal(
+      int fragmentId, LanceInputPartition inputPartition, Dataset sharedDataset) {
+    Dataset dataset = sharedDataset;
+    boolean datasetExternallyOwned = sharedDataset != null;
+    LanceScanner lanceScanner = null;
+    long dsOpenTimeNs = 0L;
     try {
       LanceSparkReadOptions readOptions = inputPartition.getReadOptions();
       // Optionally rebuild the namespace client on the executor so the dataset open routes through
@@ -77,10 +108,14 @@ public class LanceFragmentScanner implements AutoCloseable {
           readOptions.setNamespace(null);
         }
       }
-      dataset =
-          Utils.openDatasetBuilder(readOptions)
-              .initialStorageOptions(inputPartition.getInitialStorageOptions())
-              .build();
+      if (dataset == null) {
+        long dsOpenStart = System.nanoTime();
+        dataset =
+            Utils.openDatasetBuilder(readOptions)
+                .initialStorageOptions(inputPartition.getInitialStorageOptions())
+                .build();
+        dsOpenTimeNs = System.nanoTime() - dsOpenStart;
+      }
       Fragment fragment = dataset.getFragment(fragmentId);
       if (fragment == null) {
         throw new IllegalStateException(
@@ -130,9 +165,18 @@ public class LanceFragmentScanner implements AutoCloseable {
           fragment.newScan(scanOptions.build()),
           fragmentId,
           withFragmentId,
-          inputPartition);
+          inputPartition,
+          datasetExternallyOwned);
     } catch (Throwable throwable) {
-      if (dataset != null) {
+      if (lanceScanner != null) {
+        try {
+          lanceScanner.close();
+        } catch (Throwable closeError) {
+          throwable.addSuppressed(closeError);
+        }
+      }
+      // Only close the dataset if WE opened it in this call.
+      if (dataset != null && !datasetExternallyOwned) {
         try {
           dataset.close();
         } catch (Throwable closeError) {
@@ -190,7 +234,7 @@ public class LanceFragmentScanner implements AutoCloseable {
         primary = t;
       }
     }
-    if (dataset != null) {
+    if (dataset != null && !datasetExternallyOwned) {
       try {
         dataset.close();
       } catch (Throwable t) {

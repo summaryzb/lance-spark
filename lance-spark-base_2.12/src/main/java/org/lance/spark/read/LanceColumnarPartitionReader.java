@@ -13,7 +13,11 @@
  */
 package org.lance.spark.read;
 
+import org.lance.Dataset;
+import org.lance.spark.LanceRuntime;
+import org.lance.spark.LanceSparkReadOptions;
 import org.lance.spark.internal.LanceFragmentColumnarBatchScanner;
+import org.lance.spark.utils.Utils;
 
 import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 import org.apache.spark.sql.connector.read.PartitionReader;
@@ -36,6 +40,13 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
    */
   private volatile long fragmentsOpened;
 
+  /**
+   * Lazily opened dataset shared across every fragment in this partition. One {@link Dataset}
+   * handle is cheaper than re-opening per fragment, which matters when {@link LanceFragmentPacker}
+   * packs many small fragments into a single Spark task.
+   */
+  private Dataset sharedDataset;
+
   public LanceColumnarPartitionReader(LanceInputPartition inputPartition) {
     this.inputPartition = inputPartition;
     this.fragmentIndex = 0;
@@ -55,9 +66,12 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
       if (fragmentReader != null) {
         fragmentReader.close();
       }
+      Dataset dataset = ensureSharedDataset();
       fragmentReader =
           LanceFragmentColumnarBatchScanner.create(
-              inputPartition.getLanceSplit().getFragments().get(fragmentIndex), inputPartition);
+              inputPartition.getLanceSplit().getFragments().get(fragmentIndex),
+              inputPartition,
+              dataset);
       fragmentIndex++;
       fragmentsOpened++;
       if (loadNextBatchFromCurrentReader()) {
@@ -84,6 +98,23 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
     };
   }
 
+  private Dataset ensureSharedDataset() {
+    if (sharedDataset != null) {
+      return sharedDataset;
+    }
+    LanceSparkReadOptions readOptions = inputPartition.getReadOptions();
+    if (inputPartition.getNamespaceImpl() != null) {
+      readOptions.setNamespace(
+          LanceRuntime.getOrCreateNamespace(
+              inputPartition.getNamespaceImpl(), inputPartition.getNamespaceProperties()));
+    }
+    sharedDataset =
+        Utils.openDatasetBuilder(readOptions)
+            .initialStorageOptions(inputPartition.getInitialStorageOptions())
+            .build();
+    return sharedDataset;
+  }
+
   private boolean loadNextBatchFromCurrentReader() throws IOException {
     if (fragmentReader != null && fragmentReader.loadNextBatch()) {
       currentBatch = fragmentReader.getCurrentBatch();
@@ -99,12 +130,28 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
 
   @Override
   public void close() throws IOException {
+    IOException primary = null;
     if (fragmentReader != null) {
       try {
         fragmentReader.close();
       } catch (Exception e) {
-        throw new IOException(e);
+        primary = e instanceof IOException ? (IOException) e : new IOException(e);
       }
+    }
+    if (sharedDataset != null) {
+      try {
+        sharedDataset.close();
+      } catch (Exception e) {
+        IOException wrapped = e instanceof IOException ? (IOException) e : new IOException(e);
+        if (primary != null) {
+          primary.addSuppressed(wrapped);
+        } else {
+          primary = wrapped;
+        }
+      }
+    }
+    if (primary != null) {
+      throw primary;
     }
   }
 }

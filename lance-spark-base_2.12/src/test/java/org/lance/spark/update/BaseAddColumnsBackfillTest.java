@@ -177,7 +177,7 @@ public abstract class BaseAddColumnsBackfillTest {
     spark.sql(String.format("alter table %s add columns new_col1 from tmp_view", fullTable));
 
     Assertions.assertEquals(
-        "[[0,new_col_1_0,text_0], [1,new_col_1_1,text_1], [2,null,text_2], [3,null,text_3], [4,new_col_1_4,text_4], [5,null,text_5], [6,null,text_6], [7,null,text_7], [8,new_col_1_8,text_8], [9,new_col_1_9,text_9]]",
+        "[[0,new_col_1_0,text_0], [1,new_col_1_1,text_1], [4,new_col_1_4,text_4], [8,new_col_1_8,text_8], [9,new_col_1_9,text_9], [2,null,text_2], [3,null,text_3], [5,null,text_5], [6,null,text_6], [7,null,text_7]]",
         spark
             .sql(String.format("select id, new_col1, text from %s", fullTable))
             .collectAsList()

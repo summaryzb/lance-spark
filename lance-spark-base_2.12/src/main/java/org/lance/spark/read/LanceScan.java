@@ -316,6 +316,14 @@ public class LanceScan
     int survived = prunedSplits.size();
     long totalEliminated = Math.max(0L, (long) totalSplits - survived);
     this.fragmentsPrunedStatic = Math.max(0L, totalEliminated - fragmentsPrunedRuntime);
+    // Byte-size-based fragment packing: merge multiple small fragments into a single
+    // multi-fragment split so the emitted Spark task count tracks IO cost, not fragment count.
+    // This MUST run after all pruning — otherwise already-eliminated fragments would be
+    // re-bundled. Skipped when SPJ is active (partitionInfo != null) because SPJ requires one
+    // fragment per InputPartition so the emitted partition key matches a single value. Also
+    // skipped when a TopN is pushed, because multi-fragment per-partition scans would break
+    // Lance's per-scan ordering contract.
+    prunedSplits = maybePackFragments(prunedSplits, planResult.getFragmentByteSizes());
 
     // Capture as effectively final for use in lambda
     final List<LanceSplit> finalSplits = prunedSplits;
@@ -330,7 +338,7 @@ public class LanceScan
                 i -> {
                   LanceSplit split = finalSplits.get(i);
                   InternalRow partKeyRow = null;
-                  if (partitionInfo != null) {
+                  if (partitionInfo != null && split.getFragments().size() == 1) {
                     int fragId = split.getFragments().get(0);
                     partKeyRow = partitionInfo.partitionKeyForFragment(fragId);
                   }
@@ -474,6 +482,53 @@ public class LanceScan
     }
 
     return pruned;
+  }
+
+  /**
+   * Merges multiple small fragments into multi-fragment {@link LanceSplit}s using {@link
+   * LanceFragmentPacker}. Returns {@code allSplits} unchanged when packing is inapplicable:
+   *
+   * <ul>
+   *   <li>Storage-partitioned joins (SPJ): {@code partitionInfo != null} — Spark's {@link
+   *       KeyGroupedPartitioning} contract requires one fragment per input partition so the
+   *       advertised partition-key value is unique.
+   *   <li>TopN push-down: {@code topNSortOrders.isPresent()} — Lance's fragment scan emits rows
+   *       ordered per-fragment, and merging fragments across a single reader breaks that contract.
+   *   <li>The list contains fewer than two single-fragment splits: nothing to merge.
+   * </ul>
+   */
+  private List<LanceSplit> maybePackFragments(
+      List<LanceSplit> allSplits, java.util.Map<Integer, Long> fragmentByteSizes) {
+    if (allSplits.size() < 2) {
+      return allSplits;
+    }
+    if (partitionInfo != null) {
+      return allSplits;
+    }
+    if (topNSortOrders.isPresent()) {
+      return allSplits;
+    }
+
+    SparkSession session;
+    try {
+      session = SparkSession.active();
+    } catch (Throwable t) {
+      // No active session (e.g., some unit-test contexts). Skip packing, preserve semantics.
+      LOG.debug("No active SparkSession for fragment packing; skipping.");
+      return allSplits;
+    }
+
+    List<LanceSplit> packed =
+        LanceFragmentPacker.packFragmentsIntoSplits(session, allSplits, fragmentByteSizes);
+    if (packed.size() < allSplits.size()) {
+      LOG.info(
+          "LanceFragmentPacker merged {} single-fragment splits into {} byte-sized splits"
+              + " for scan={}",
+          allSplits.size(),
+          packed.size(),
+          description());
+    }
+    return packed;
   }
 
   /**
