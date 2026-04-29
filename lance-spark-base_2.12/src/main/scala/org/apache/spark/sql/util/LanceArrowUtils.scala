@@ -144,8 +144,8 @@ object LanceArrowUtils {
         // when LanceArrowColumnVector tries to read the data.
         throw unsupportedDataTypeError(
           s"DECIMAL256(${d.getPrecision}, ${d.getScale}) in column '${field.getName}'." +
-          " Lance-Spark only supports 128-bit decimal (precision <= 38)." +
-          " Consider converting the column to a compatible DECIMAL type before reading.")
+            " Lance-Spark only supports 128-bit decimal (precision <= 38)." +
+            " Consider converting the column to a compatible DECIMAL type before reading.")
       case _ => ArrowUtils.fromArrowField(field)
     }
   }
