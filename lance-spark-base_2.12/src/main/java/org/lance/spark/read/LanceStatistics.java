@@ -15,11 +15,12 @@ package org.lance.spark.read;
 
 import org.lance.ManifestSummary;
 
+import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.read.Statistics;
-import org.apache.spark.sql.types.StructField;
-import org.apache.spark.sql.types.StructType;
+import org.apache.spark.sql.connector.read.colstats.ColumnStatistics;
 
 import java.io.Serializable;
+import java.util.Map;
 import java.util.OptionalLong;
 
 /**
@@ -27,10 +28,12 @@ import java.util.OptionalLong;
  * statistics from the manifest metadata.
  */
 public class LanceStatistics implements Statistics, Serializable {
+  public static final String STATS_PREFIX = "spark.sql.statistics.colStats.";
   private static final long serialVersionUID = 1L;
 
   private final long numRows;
   private final long sizeInBytes;
+  private Map<NamedReference, ColumnStatistics> columnStats;
 
   /**
    * Create statistics from a ManifestSummary.
@@ -45,6 +48,13 @@ public class LanceStatistics implements Statistics, Serializable {
   public LanceStatistics(long numRows, long sizeInBytes) {
     this.numRows = numRows;
     this.sizeInBytes = sizeInBytes;
+  }
+
+  public LanceStatistics(
+      long numRows, long sizeInBytes, Map<NamedReference, ColumnStatistics> columnStats) {
+    this.numRows = numRows;
+    this.sizeInBytes = sizeInBytes;
+    this.columnStats = columnStats;
   }
 
   /**
@@ -67,52 +77,6 @@ public class LanceStatistics implements Statistics, Serializable {
     return new LanceStatistics((long) (totalRows * ratio), (long) (totalFilesSize * ratio));
   }
 
-  /**
-   * Estimate post-projection size using {@code sizeInBytes × (projectedWidths / fullWidths)}, the
-   * same formula Spark's DSv2 {@code FileScan.estimateStatistics} applies after column pruning (see
-   * {@code org.apache.spark.sql.execution.datasources.v2.FileScan}). Lets {@code JoinSelection} see
-   * a projection-aware size so broadcast decisions line up with what DSv1 Parquet produces through
-   * the optimizer's {@code Project.computeStats()} path — within the 8-byte-per-row overhead DSv1
-   * adds via {@code EstimationUtils.getSizePerRow}, which rounds estimates apart by a few percent
-   * but doesn't shift broadcast thresholds in practice.
-   *
-   * <p>Width-weighted (not {@code numRows × sumOfWidths}) on purpose: the ratio preserves the
-   * compression baked into {@code fullSizeInBytes}, whereas a row-count formula would ignore
-   * on-disk encoding and systematically over-count columnar sources.
-   *
-   * @param numRows projected row count (post fragment-pruning if any)
-   * @param fullSizeInBytes on-disk size of the full (pre-projection) dataset in bytes
-   * @param fullSchema schema of the full dataset before column pruning
-   * @param projectedSchema pruned schema containing only columns actually read by the scan
-   * @return statistics with {@code sizeInBytes} scaled by width-weighted column ratio
-   */
-  public static LanceStatistics estimateProjected(
-      long numRows, long fullSizeInBytes, StructType fullSchema, StructType projectedSchema) {
-    long projWidth = sumWidths(projectedSchema);
-    long fullWidth = sumWidths(fullSchema);
-    long sizeInBytes;
-    if (fullWidth <= 0 || projWidth <= 0 || projWidth >= fullWidth) {
-      sizeInBytes = fullSizeInBytes;
-    } else {
-      // Promote to double to avoid long overflow in fullSizeInBytes * projWidth.
-      sizeInBytes = (long) ((double) fullSizeInBytes * projWidth / fullWidth);
-    }
-    // Clamp to 1: integer truncation can round very small scaled sizes to 0, which
-    // JoinSelection reads as "below threshold" and would unintentionally force a broadcast.
-    return new LanceStatistics(numRows, Math.max(sizeInBytes, 1L));
-  }
-
-  private static long sumWidths(StructType schema) {
-    if (schema == null) {
-      return 0;
-    }
-    long sum = 0;
-    for (StructField field : schema.fields()) {
-      sum += field.dataType().defaultSize();
-    }
-    return sum;
-  }
-
   @Override
   public OptionalLong sizeInBytes() {
     return OptionalLong.of(sizeInBytes);
@@ -121,5 +85,10 @@ public class LanceStatistics implements Statistics, Serializable {
   @Override
   public OptionalLong numRows() {
     return OptionalLong.of(numRows);
+  }
+
+  @Override
+  public Map<NamedReference, ColumnStatistics> columnStats() {
+    return columnStats != null ? columnStats : java.util.Collections.emptyMap();
   }
 }

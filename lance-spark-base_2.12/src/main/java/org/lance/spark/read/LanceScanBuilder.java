@@ -292,7 +292,8 @@ public class LanceScanBuilder
       projectedFullSize = (long) (projectedFullSize * ratio);
     }
     LanceStatistics statistics =
-        LanceStatistics.estimateProjected(projectedRows, projectedFullSize, fullSchema, schema);
+        CatalogColumnStatAdapter.estimateProjected(
+            projectedRows, projectedFullSize, fullSchema, tableProperties);
     if (survivingFragmentIds != null) {
       LOG.debug(
           "Scan statistics after pruning: {} of {} fragments survive,"

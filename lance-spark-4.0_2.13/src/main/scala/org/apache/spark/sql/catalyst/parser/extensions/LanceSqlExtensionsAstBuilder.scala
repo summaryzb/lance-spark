@@ -15,7 +15,7 @@ package org.apache.spark.sql.catalyst.parser.extensions
 
 import org.apache.spark.sql.catalyst.analysis.{UnresolvedIdentifier, UnresolvedRelation}
 import org.apache.spark.sql.catalyst.parser.ParserInterface
-import org.apache.spark.sql.catalyst.plans.logical.{AddColumnsBackfill, AddIndex, LanceDropIndex, LanceNamedArgument, LogicalPlan, Optimize, SetUnenforcedPrimaryKey, ShowIndexes, UpdateColumnsBackfill, Vacuum}
+import org.apache.spark.sql.catalyst.plans.logical.{AddColumnsBackfill, AddIndex, AddStatics, LanceDropIndex, LanceNamedArgument, LogicalPlan, Optimize, SetUnenforcedPrimaryKey, ShowIndexes, UpdateColumnsBackfill, Vacuum}
 import org.lance.spark.utils.ParserUtils
 
 import scala.jdk.CollectionConverters._
@@ -110,6 +110,13 @@ class LanceSqlExtensionsAstBuilder(delegate: ParserInterface)
     val table = UnresolvedIdentifier(visitMultipartIdentifier(ctx.multipartIdentifier()))
     val columns = visitColumnList(ctx.columnList())
     SetUnenforcedPrimaryKey(table, columns)
+  }
+
+  override def visitAddStatics(
+      ctx: LanceSqlExtensionsParser.AddStaticsContext): AddStatics = {
+    val table = UnresolvedIdentifier(visitMultipartIdentifier(ctx.multipartIdentifier()))
+    val columns = Option(ctx.columnList()).map(visitColumnList).getOrElse(Seq.empty)
+    AddStatics(table, columns)
   }
 
   override def visitStringLiteral(ctx: LanceSqlExtensionsParser.StringLiteralContext): String = {

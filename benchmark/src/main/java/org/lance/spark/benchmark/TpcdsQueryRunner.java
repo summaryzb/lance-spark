@@ -34,8 +34,11 @@ import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.execution.SparkPlan;
 import org.apache.spark.sql.execution.metric.SQLMetric;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class TpcdsQueryRunner {
+  private static final Logger LOG = LoggerFactory.getLogger(TpcdsQueryRunner.class);
 
   /** SparkConf key for Lance's DFP kill-switch. */
   private static final String SPARK_CONF_RUNTIME_FILTERING_ENABLED =
@@ -249,6 +252,7 @@ public class TpcdsQueryRunner {
       }
       return BenchmarkResult.success(queryName, format, iteration, elapsed, metrics, dfpMode);
     } catch (Exception e) {
+        LOG.info("run " + queryName + "fail, reason:" , e);
       long elapsed = System.currentTimeMillis() - start;
       if (timedOut.get()) {
         // Timeout-driven cancellation. Use the configured timeout in the message rather than

@@ -54,6 +54,9 @@ case class LanceDataSourceV2Strategy(session: SparkSession) extends SparkStrateg
     case SetUnenforcedPrimaryKey(ResolvedIdentifier(catalog, ident), columns) =>
       SetUnenforcedPrimaryKeyExec(asTableCatalog(catalog), ident, columns) :: Nil
 
+    case AddStatics(ResolvedIdentifier(catalog, ident), columns) =>
+      AddStaticsExec(asTableCatalog(catalog), ident, columns) :: Nil
+
     case _ => Nil
   }
 

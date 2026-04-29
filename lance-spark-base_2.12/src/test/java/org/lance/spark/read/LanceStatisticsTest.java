@@ -13,10 +13,15 @@
  */
 package org.lance.spark.read;
 
+import org.apache.spark.sql.connector.expressions.NamedReference;
+import org.apache.spark.sql.connector.read.colstats.ColumnStatistics;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.Test;
+
+import java.util.HashMap;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -101,7 +106,8 @@ public class LanceStatisticsTest {
               new StructField("c2", DataTypes.LongType, true, null),
               new StructField("c3", DataTypes.LongType, true, null)
             });
-    LanceStatistics stats = LanceStatistics.estimateProjected(1000, 24_000_000L, full, projected);
+    LanceStatistics stats =
+        CatalogColumnStatAdapter.estimateProjected(1000, 24_000_000L, full, projected);
     assertEquals(1000, stats.numRows().getAsLong());
     assertEquals(8_000_000L, stats.sizeInBytes().getAsLong());
   }
@@ -120,7 +126,8 @@ public class LanceStatisticsTest {
     StructType projected =
         new StructType(
             new StructField[] {new StructField("name", DataTypes.StringType, true, null)});
-    LanceStatistics stats = LanceStatistics.estimateProjected(1000, 24_000L, full, projected);
+    LanceStatistics stats =
+        CatalogColumnStatAdapter.estimateProjected(1000, 24_000L, full, projected);
     assertEquals(20_000L, stats.sizeInBytes().getAsLong());
   }
 
@@ -129,7 +136,7 @@ public class LanceStatisticsTest {
     // Projection == full schema → no scaling.
     StructType full =
         new StructType(new StructField[] {new StructField("a", DataTypes.LongType, true, null)});
-    LanceStatistics stats = LanceStatistics.estimateProjected(1000, 50_000L, full, full);
+    LanceStatistics stats = CatalogColumnStatAdapter.estimateProjected(1000, 50_000L, full, full);
     assertEquals(50_000L, stats.sizeInBytes().getAsLong());
   }
 
@@ -139,7 +146,8 @@ public class LanceStatisticsTest {
     StructType full =
         new StructType(new StructField[] {new StructField("a", DataTypes.LongType, true, null)});
     StructType projected = new StructType(new StructField[] {});
-    LanceStatistics stats = LanceStatistics.estimateProjected(1000, 50_000L, full, projected);
+    LanceStatistics stats =
+        CatalogColumnStatAdapter.estimateProjected(1000, 50_000L, full, projected);
     assertEquals(50_000L, stats.sizeInBytes().getAsLong());
   }
 
@@ -147,7 +155,7 @@ public class LanceStatisticsTest {
   public void testEstimateProjectedNeverZero() {
     StructType full =
         new StructType(new StructField[] {new StructField("a", DataTypes.LongType, true, null)});
-    LanceStatistics stats = LanceStatistics.estimateProjected(0, 0L, full, full);
+    LanceStatistics stats = CatalogColumnStatAdapter.estimateProjected(0, 0L, full, full);
     assertEquals(1, stats.sizeInBytes().getAsLong());
   }
 
@@ -169,7 +177,68 @@ public class LanceStatisticsTest {
         new StructType(new StructField[] {new StructField("key", DataTypes.LongType, true, null)});
     // fullWidths = 8 + 5*20 = 108; projWidths = 8.
     // 10 bytes × 8 / 108 = 0.74 → (long) cast → 0 → clamp → 1.
-    LanceStatistics stats = LanceStatistics.estimateProjected(1000, 10L, full, projected);
+    LanceStatistics stats = CatalogColumnStatAdapter.estimateProjected(1000, 10L, full, projected);
     assertEquals(1L, stats.sizeInBytes().getAsLong());
+  }
+
+  @Test
+  public void testEstimateProjectedWithPropertiesReturnsNamedReferenceKeys() {
+    // Keys in columnStats() must be NamedReference (not raw String).
+    // Build properties with a single column stat for "age".
+    StructType schema =
+        new StructType(new StructField[] {new StructField("age", DataTypes.LongType, false, null)});
+    Map<String, String> props = new HashMap<>();
+    props.put("spark.sql.statistics.colStats.age.distinctCount", "50");
+    props.put("spark.sql.statistics.colStats.age.nullCount", "0");
+    props.put("spark.sql.statistics.colStats.age.avgLen", "8");
+    props.put("spark.sql.statistics.colStats.age.maxLen", "8");
+    props.put("spark.sql.statistics.colStats.age.version", "2");
+
+    LanceStatistics stats =
+        CatalogColumnStatAdapter.estimateProjected(1000L, 50_000L, schema, props);
+
+    Map<NamedReference, ColumnStatistics> colStats = stats.columnStats();
+    assertEquals(1, colStats.size());
+    NamedReference key = colStats.keySet().iterator().next();
+    // NamedReference.describe() returns the column name — Spark uses this to match attributes.
+    assertEquals("age", key.describe());
+  }
+
+  @Test
+  public void testEstimateProjectedWithPropertiesConvertsNumericStats() {
+    // ColumnStatistics values must expose correct OptionalLong values from CatalogColumnStat.
+    StructType schema =
+        new StructType(new StructField[] {new StructField("age", DataTypes.LongType, false, null)});
+    Map<String, String> props = new HashMap<>();
+    props.put("spark.sql.statistics.colStats.age.distinctCount", "50");
+    props.put("spark.sql.statistics.colStats.age.nullCount", "3");
+    props.put("spark.sql.statistics.colStats.age.avgLen", "8");
+    props.put("spark.sql.statistics.colStats.age.maxLen", "8");
+    props.put("spark.sql.statistics.colStats.age.version", "2");
+
+    LanceStatistics stats =
+        CatalogColumnStatAdapter.estimateProjected(1000L, 50_000L, schema, props);
+
+    ColumnStatistics cs = stats.columnStats().values().iterator().next();
+    assertTrue(cs.distinctCount().isPresent());
+    assertEquals(50L, cs.distinctCount().getAsLong());
+    assertTrue(cs.nullCount().isPresent());
+    assertEquals(3L, cs.nullCount().getAsLong());
+    assertTrue(cs.avgLen().isPresent());
+    assertEquals(8L, cs.avgLen().getAsLong());
+    assertTrue(cs.maxLen().isPresent());
+    assertEquals(8L, cs.maxLen().getAsLong());
+  }
+
+  @Test
+  public void testEstimateProjectedWithPropertiesEmptyPropsReturnsEmptyColumnStats() {
+    // No colStats properties → columnStats() should be empty map, not null.
+    StructType schema =
+        new StructType(new StructField[] {new StructField("id", DataTypes.LongType, false, null)});
+    LanceStatistics stats =
+        CatalogColumnStatAdapter.estimateProjected(1000L, 50_000L, schema, new HashMap<>());
+    assertTrue(stats.columnStats().isEmpty());
+    assertEquals(1000L, stats.numRows().getAsLong());
+    assertEquals(50_000L, stats.sizeInBytes().getAsLong());
   }
 }

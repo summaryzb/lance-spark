@@ -27,6 +27,7 @@ statement
     | OPTIMIZE multipartIdentifier (WITH '(' (namedArgument (',' namedArgument)*)? ')')?        #optimize
     | VACUUM multipartIdentifier (WITH '(' (namedArgument (',' namedArgument)*)? ')')?          #vacuum
     | ALTER TABLE multipartIdentifier SET UNENFORCED PRIMARY KEY '(' columnList ')'             #setUnenforcedPrimaryKey
+    | ALTER TABLE multipartIdentifier ADD STATICS ('(' columnList ')')?                         #addStatics
     ;
 
 multipartIdentifier
@@ -79,6 +80,7 @@ KEY: 'KEY';
 OPTIMIZE: 'OPTIMIZE';
 PRIMARY: 'PRIMARY';
 SET: 'SET';
+STATICS: 'STATICS';
 SHOW: 'SHOW';
 TABLE: 'TABLE';
 UNENFORCED: 'UNENFORCED';
