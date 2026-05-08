@@ -23,13 +23,12 @@ package org.apache.spark.sql.util
  * It has been modified by the Lance developers to fit the needs of the Lance project.
  */
 
+import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.arrow.vector.complex.MapVector
 import org.apache.arrow.vector.types.{DateUnit, FloatingPointPrecision, IntervalUnit, TimeUnit}
 import org.apache.arrow.vector.types.pojo.{ArrowType, Field, FieldType, Schema}
 import org.apache.spark.{SparkException, SparkUnsupportedOperationException}
 import org.apache.spark.sql.types._
-import org.json4s.{DefaultFormats, Formats}
-import org.json4s.JsonAST.{JObject, JString}
 import org.lance.spark.LanceConstant
 import org.lance.spark.utils.{BlobUtils, DateMilliUtils, Float16Utils, LargeVarCharUtils, VectorUtils}
 
@@ -39,6 +38,9 @@ import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.JavaConverters._
 
 object LanceArrowUtils {
+
+  private val mapper = new ObjectMapper()
+
   val ARROW_FIXED_SIZE_LIST_SIZE_KEY = VectorUtils.ARROW_FIXED_SIZE_LIST_SIZE_KEY
   val ARROW_FLOAT16_KEY = Float16Utils.ARROW_FLOAT16_KEY
   val ENCODING_BLOB = BlobUtils.LANCE_ENCODING_BLOB_KEY
@@ -79,9 +81,7 @@ object LanceArrowUtils {
               LongType
             case _ => fromArrowField(childField)
           }
-          val baseMeta = Metadata.fromJObject(
-            JObject(childField.getMetadata.asScala
-              .map { case (k, v) => (k, JString(v)) }.toList))
+          val baseMeta = Metadata.fromJson(mapper.writeValueAsString(childField.getMetadata))
           val childMeta = childField.getType match {
             case d: ArrowType.Date if d.getUnit == DateUnit.MILLISECOND =>
               new MetadataBuilder()
@@ -170,15 +170,13 @@ object LanceArrowUtils {
             .putString(ARROW_LARGE_VAR_CHAR_KEY, "true")
             .build()
         case date: ArrowType.Date if date.getUnit == DateUnit.MILLISECOND =>
-          val base = Metadata.fromJObject(
-            JObject(field.getMetadata.asScala
-              .map { case (k, v) => (k, JString(v)) }.toList))
+          val base = Metadata.fromJson(mapper.writeValueAsString(field.getMetadata))
           new MetadataBuilder()
             .withMetadata(base)
             .putString(ARROW_DATE_MILLISECOND_KEY, DateMilliUtils.ARROW_DATE_MILLISECOND_VALUE)
             .build()
-        case _ => Metadata.fromJObject(
-            JObject(field.getMetadata.asScala.map { case (k, v) => (k, JString(v)) }.toList))
+        case _ => Metadata.fromJson(
+            mapper.writeValueAsString(field.getMetadata))
       }
       StructField(field.getName, dt, field.isNullable, metadata)
     }.toArray)
@@ -227,10 +225,9 @@ object LanceArrowUtils {
         large = true
       }
 
-      implicit val formats: Formats = DefaultFormats
-      meta = metadata.jsonValue.extract[Map[String, Object]].map { case (k, v) =>
-        (k, String.valueOf(v))
-      }
+      meta = mapper
+        .readValue(metadata.json, classOf[java.util.LinkedHashMap[_, _]])
+        .asScala.map { case (k, v) => (k.toString, String.valueOf(v)) }.toMap
     }
 
     dt match {

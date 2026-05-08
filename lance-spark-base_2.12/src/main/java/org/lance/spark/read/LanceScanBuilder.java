@@ -16,10 +16,12 @@ package org.lance.spark.read;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.ManifestSummary;
+import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
 import org.lance.index.scalar.ZoneStats;
 import org.lance.ipc.ColumnOrdering;
 import org.lance.schema.LanceField;
+import org.lance.spark.LanceConstant;
 import org.lance.spark.LanceSparkReadOptions;
 import org.lance.spark.utils.Optional;
 import org.lance.spark.utils.Utils;
@@ -91,8 +93,6 @@ public class LanceScanBuilder
 
   private final java.util.Map<String, String> tableProperties;
 
-  static final String TABLE_OPT_PARTITION_COLUMNS = "lance.partition.columns";
-
   public LanceScanBuilder(
       StructType schema,
       LanceSparkReadOptions readOptions,
@@ -141,7 +141,7 @@ public class LanceScanBuilder
 
     // Collect all columns that need zonemap stats: filter columns + partition column (if declared).
     Set<String> columnsToLoad = extractReferencedColumns(pushedFilters);
-    String partitionColumn = tableProperties.get(TABLE_OPT_PARTITION_COLUMNS);
+    String partitionColumn = tableProperties.get(LanceConstant.TABLE_OPT_PARTITION_COLUMNS);
     if (partitionColumn != null && !partitionColumn.trim().isEmpty()) {
       partitionColumn = partitionColumn.trim();
       columnsToLoad.add(partitionColumn);
@@ -162,7 +162,7 @@ public class LanceScanBuilder
             "Partition column '{}' declared in {} has no zonemap index or stats;"
                 + " partition detection disabled",
             partitionColumn,
-            TABLE_OPT_PARTITION_COLUMNS);
+            LanceConstant.TABLE_OPT_PARTITION_COLUMNS);
       } else {
         Map<Integer, Comparable<?>> partValues =
             ZonemapFragmentPruner.computeFragmentPartitionValues(zonemapStats.get(partitionColumn))
@@ -382,7 +382,10 @@ public class LanceScanBuilder
         fieldIdToName.put(field.getId(), field.getName());
       }
 
-      for (IndexDescription idx : dataset.describeIndices()) {
+      // Use the criteria-based overload so that indexes missing index_details
+      // (created by older versions) are silently skipped instead of causing errors.
+      IndexCriteria criteria = new IndexCriteria.Builder().build();
+      for (IndexDescription idx : dataset.describeIndices(criteria)) {
         if ("ZONEMAP".equalsIgnoreCase(idx.getIndexType())) {
           for (int fieldId : idx.getFieldIds()) {
             String name = fieldIdToName.get(fieldId);
