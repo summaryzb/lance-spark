@@ -52,8 +52,8 @@ public abstract class BaseLanceReadMetricsIntegrationTest {
 
   /**
    * SparkListener that captures custom metric accumulator values from task-end events. Keyed by
-   * metric name (e.g. "fragmentsScanned"), translated from the description that Spark uses as the
-   * accumulator name.
+   * metric name (e.g. "numFragmentsScanned"), translated from the description that Spark uses as
+   * the accumulator name.
    */
   static class MetricsCapturingListener extends SparkListener {
     private final Map<String, Long> metricValues = new ConcurrentHashMap<>();
@@ -117,7 +117,6 @@ public abstract class BaseLanceReadMetricsIntegrationTest {
 
   @Test
   void testSupportedCustomMetricsCount() {
-    // Verify LanceScan declares exactly 7 custom metrics
     CustomMetric[] metrics = LanceCustomMetrics.allMetrics();
     assertEquals(6, metrics.length);
   }
@@ -158,11 +157,14 @@ public abstract class BaseLanceReadMetricsIntegrationTest {
     Map<String, Long> metrics = metricsListener.getMetricValues();
 
     assertTrue(
-        metrics.getOrDefault(LanceCustomMetrics.FRAGMENTS_SCANNED, 0L) > 0,
-        "fragmentsScanned should be > 0");
+        metrics.getOrDefault(LanceCustomMetrics.NUM_FRAGMENTS_SCANNED, 0L) > 0,
+        "numFragmentsScanned should be > 0");
     assertTrue(
-        metrics.getOrDefault(LanceCustomMetrics.BATCHES_READ, 0L) >= 1,
-        "batchesRead should be >= 1");
+        metrics.getOrDefault(LanceCustomMetrics.NUM_BATCHES_LOADED, 0L) >= 1,
+        "numBatchesLoaded should be >= 1");
+    assertTrue(
+        metrics.getOrDefault(LanceCustomMetrics.NUM_ROWS_SCANNED, 0L) > 0,
+        "numRowsScanned should be > 0");
     assertTrue(
         metrics.getOrDefault(LanceCustomMetrics.DATASET_OPEN_TIME_NS, 0L) > 0,
         "datasetOpenTimeNs should be > 0");
@@ -172,20 +174,6 @@ public abstract class BaseLanceReadMetricsIntegrationTest {
     assertTrue(
         metrics.getOrDefault(LanceCustomMetrics.BATCH_LOAD_TIME_NS, 0L) > 0,
         "batchLoadTimeNs should be > 0");
-    assertTrue(
-        metrics.getOrDefault(LanceCustomMetrics.SCAN_TIME_NS, 0L) > 0, "scanTimeNs should be > 0");
-
-    // Verify scanTimeNs == sum of sub-timings after Spark aggregation
-    long scanTimeNs = metrics.getOrDefault(LanceCustomMetrics.SCAN_TIME_NS, 0L);
-    long expectedScanTimeNs =
-        metrics.getOrDefault(LanceCustomMetrics.DATASET_OPEN_TIME_NS, 0L)
-            + metrics.getOrDefault(LanceCustomMetrics.SCANNER_CREATE_TIME_NS, 0L)
-            + metrics.getOrDefault(LanceCustomMetrics.BATCH_LOAD_TIME_NS, 0L);
-    assertEquals(
-        expectedScanTimeNs,
-        scanTimeNs,
-        "scanTimeNs should equal sum of datasetOpenTimeNs + scannerCreateTimeNs"
-            + " + batchLoadTimeNs");
   }
 
   @Test
@@ -198,11 +186,14 @@ public abstract class BaseLanceReadMetricsIntegrationTest {
     Map<String, Long> metrics = metricsListener.getMetricValues();
 
     assertTrue(
-        metrics.getOrDefault(LanceCustomMetrics.FRAGMENTS_SCANNED, 0L) > 0,
-        "fragmentsScanned should be > 0 for COUNT(*)");
+        metrics.getOrDefault(LanceCustomMetrics.NUM_FRAGMENTS_SCANNED, 0L) > 0,
+        "numFragmentsScanned should be > 0 for COUNT(*)");
     assertTrue(
-        metrics.getOrDefault(LanceCustomMetrics.BATCHES_READ, 0L) >= 1,
-        "batchesRead should be >= 1 for COUNT(*)");
+        metrics.getOrDefault(LanceCustomMetrics.NUM_BATCHES_LOADED, 0L) >= 1,
+        "numBatchesLoaded should be >= 1 for COUNT(*)");
+    assertTrue(
+        metrics.getOrDefault(LanceCustomMetrics.NUM_ROWS_SCANNED, 0L) > 0,
+        "numRowsScanned should be > 0 for COUNT(*)");
     assertTrue(
         metrics.getOrDefault(LanceCustomMetrics.DATASET_OPEN_TIME_NS, 0L) > 0,
         "datasetOpenTimeNs should be > 0 for COUNT(*)");
@@ -212,8 +203,5 @@ public abstract class BaseLanceReadMetricsIntegrationTest {
     assertTrue(
         metrics.getOrDefault(LanceCustomMetrics.BATCH_LOAD_TIME_NS, 0L) > 0,
         "batchLoadTimeNs should be > 0 for COUNT(*)");
-    assertTrue(
-        metrics.getOrDefault(LanceCustomMetrics.SCAN_TIME_NS, 0L) > 0,
-        "scanTimeNs should be > 0 for COUNT(*)");
   }
 }

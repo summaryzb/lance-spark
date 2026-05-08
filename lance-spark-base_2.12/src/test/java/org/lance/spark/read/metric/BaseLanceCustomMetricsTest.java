@@ -23,6 +23,7 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public abstract class BaseLanceCustomMetricsTest {
@@ -47,9 +48,9 @@ public abstract class BaseLanceCustomMetricsTest {
     Set<String> expected =
         new HashSet<>(
             Arrays.asList(
-                LanceCustomMetrics.FRAGMENTS_SCANNED,
-                LanceCustomMetrics.BATCHES_READ,
-                LanceCustomMetrics.SCAN_TIME_NS,
+                LanceCustomMetrics.NUM_FRAGMENTS_SCANNED,
+                LanceCustomMetrics.NUM_BATCHES_LOADED,
+                LanceCustomMetrics.NUM_ROWS_SCANNED,
                 LanceCustomMetrics.DATASET_OPEN_TIME_NS,
                 LanceCustomMetrics.SCANNER_CREATE_TIME_NS,
                 LanceCustomMetrics.BATCH_LOAD_TIME_NS));
@@ -80,20 +81,43 @@ public abstract class BaseLanceCustomMetricsTest {
   }
 
   @Test
-  void testSumAggregation() {
-    // CustomSumMetric.aggregateTaskMetrics should sum all values
-    LanceCustomMetrics.FragmentsScannedMetric metric =
-        new LanceCustomMetrics.FragmentsScannedMetric();
+  void testCountAggregationReturnsRawLong() {
+    LanceCustomMetrics.NumFragmentsScannedMetric metric =
+        new LanceCustomMetrics.NumFragmentsScannedMetric();
     String result = metric.aggregateTaskMetrics(new long[] {3, 5, 7});
     assertEquals("15", result);
   }
 
   @Test
-  void testSumAggregationEmpty() {
-    LanceCustomMetrics.FragmentsScannedMetric metric =
-        new LanceCustomMetrics.FragmentsScannedMetric();
+  void testCountAggregationEmpty() {
+    LanceCustomMetrics.NumFragmentsScannedMetric metric =
+        new LanceCustomMetrics.NumFragmentsScannedMetric();
     String result = metric.aggregateTaskMetrics(new long[] {});
     assertEquals("0", result);
+  }
+
+  @Test
+  void testTimeAggregationFormatsDuration() {
+    LanceCustomMetrics.BatchLoadTimeNsMetric metric =
+        new LanceCustomMetrics.BatchLoadTimeNsMetric();
+    assertEquals("1.5 s", metric.aggregateTaskMetrics(new long[] {500_000_000L, 1_000_000_000L}));
+    assertEquals("250 ms", metric.aggregateTaskMetrics(new long[] {100_000_000L, 150_000_000L}));
+  }
+
+  @Test
+  void testFormatDurationNsThresholds() {
+    assertEquals("0 ns", CustomNsTimeMetric.formatDurationNs(0));
+    assertEquals("0 ns", CustomNsTimeMetric.formatDurationNs(-5));
+    assertEquals("999 ns", CustomNsTimeMetric.formatDurationNs(999));
+    assertEquals("1 us", CustomNsTimeMetric.formatDurationNs(1_000));
+    assertEquals("47 us", CustomNsTimeMetric.formatDurationNs(47_500));
+    assertEquals("999 us", CustomNsTimeMetric.formatDurationNs(999_999));
+    assertEquals("1 ms", CustomNsTimeMetric.formatDurationNs(1_000_000));
+    assertEquals("350 ms", CustomNsTimeMetric.formatDurationNs(350_000_000));
+    assertEquals("999 ms", CustomNsTimeMetric.formatDurationNs(999_999_999));
+    assertEquals("1.0 s", CustomNsTimeMetric.formatDurationNs(1_000_000_000L));
+    assertEquals("1.2 s", CustomNsTimeMetric.formatDurationNs(1_234_567_890L));
+    assertEquals("47.3 s", CustomNsTimeMetric.formatDurationNs(47_382_910_283L));
   }
 
   @Test
@@ -101,9 +125,9 @@ public abstract class BaseLanceCustomMetricsTest {
     // Spark instantiates metric classes via reflection — verify no-arg constructors work
     Class<?>[] metricClasses =
         new Class<?>[] {
-          LanceCustomMetrics.FragmentsScannedMetric.class,
-          LanceCustomMetrics.BatchesReadMetric.class,
-          LanceCustomMetrics.ScanTimeNsMetric.class,
+          LanceCustomMetrics.NumFragmentsScannedMetric.class,
+          LanceCustomMetrics.NumBatchesLoadedMetric.class,
+          LanceCustomMetrics.NumRowsScannedMetric.class,
           LanceCustomMetrics.DatasetOpenTimeNsMetric.class,
           LanceCustomMetrics.ScannerCreateTimeNsMetric.class,
           LanceCustomMetrics.BatchLoadTimeNsMetric.class,
@@ -127,36 +151,38 @@ public abstract class BaseLanceCustomMetricsTest {
   @Test
   void testTrackerAccumulation() {
     LanceReadMetricsTracker tracker = new LanceReadMetricsTracker();
-    tracker.addFragmentsScanned(1);
-    tracker.addFragmentsScanned(1);
-    tracker.addBatchesRead(5);
+    tracker.addNumFragmentsScanned(1);
+    tracker.addNumFragmentsScanned(1);
+    tracker.addNumBatchesLoaded(5);
+    tracker.addNumRowsScanned(1024);
     tracker.addDatasetOpenTimeNs(100_000);
     tracker.addScannerCreateTimeNs(50_000);
     tracker.addBatchLoadTimeNs(200_000);
 
-    assertEquals(2, tracker.getFragmentsScanned());
-    assertEquals(5, tracker.getBatchesRead());
+    assertEquals(2, tracker.getNumFragmentsScanned());
+    assertEquals(5, tracker.getNumBatchesLoaded());
+    assertEquals(1024, tracker.getNumRowsScanned());
     assertEquals(100_000, tracker.getDatasetOpenTimeNs());
     assertEquals(50_000, tracker.getScannerCreateTimeNs());
     assertEquals(200_000, tracker.getBatchLoadTimeNs());
-
-    // Verify scanTimeNs = sum of three sub-timings
-    CustomTaskMetric[] values = tracker.currentMetricsValues();
-    long scanTimeNs = 0;
-    for (CustomTaskMetric m : values) {
-      if (m.name().equals(LanceCustomMetrics.SCAN_TIME_NS)) {
-        scanTimeNs = m.value();
-      }
-    }
-    assertEquals(100_000 + 50_000 + 200_000, scanTimeNs);
   }
 
   @Test
-  void testTrackerBulkAddFragmentsScanned() {
+  void testTrackerSnapshotReflectsLiveFields() {
+    // The tracker caches a single CustomTaskMetric[] at construction; each value() call
+    // must read the current field state, not a captured snapshot.
     LanceReadMetricsTracker tracker = new LanceReadMetricsTracker();
-    tracker.addFragmentsScanned(5);
-    tracker.addFragmentsScanned(3);
-    assertEquals(8, tracker.getFragmentsScanned());
+    CustomTaskMetric[] before = tracker.currentMetricsValues();
+    tracker.addNumFragmentsScanned(7);
+    CustomTaskMetric[] after = tracker.currentMetricsValues();
+    assertSame(before, after, "currentMetricsValues() should return the same cached array");
+    long observed = -1;
+    for (CustomTaskMetric m : after) {
+      if (m.name().equals(LanceCustomMetrics.NUM_FRAGMENTS_SCANNED)) {
+        observed = m.value();
+      }
+    }
+    assertEquals(7L, observed, "value() must read live field, not capture-time value");
   }
 
   @Test

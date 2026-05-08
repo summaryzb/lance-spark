@@ -78,7 +78,7 @@ public class LanceCountStarPartitionReader implements PartitionReader<ColumnarBa
       if (fragmentIds.isEmpty()) {
         return 0;
       }
-      metricsTracker.addFragmentsScanned(fragmentIds.size());
+      metricsTracker.addNumFragmentsScanned(fragmentIds.size());
 
       ScanOptions.Builder scanOptionsBuilder = new ScanOptions.Builder();
       if (inputPartition.getWhereCondition().isPresent()) {
@@ -102,7 +102,8 @@ public class LanceCountStarPartitionReader implements PartitionReader<ColumnarBa
             metricsTracker.addBatchLoadTimeNs(batchTimeNs);
             long rowCount = reader.getVectorSchemaRoot().getRowCount();
             totalCount += rowCount;
-            metricsTracker.addBatchesRead(1);
+            metricsTracker.addNumBatchesLoaded(1);
+            metricsTracker.addNumRowsScanned(rowCount);
           }
         }
       } catch (Exception e) {

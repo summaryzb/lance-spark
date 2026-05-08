@@ -47,7 +47,7 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
           LanceFragmentColumnarBatchScanner.create(
               inputPartition.getLanceSplit().getFragments().get(fragmentIndex), inputPartition);
       fragmentIndex++;
-      metricsTracker.addFragmentsScanned(1);
+      metricsTracker.addNumFragmentsScanned(1);
       metricsTracker.addDatasetOpenTimeNs(fragmentReader.getDatasetOpenTimeNs());
       metricsTracker.addScannerCreateTimeNs(fragmentReader.getScannerCreateTimeNs());
       if (loadNextBatchFromCurrentReader()) {
@@ -63,7 +63,8 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
     }
     if (fragmentReader.loadNextBatch()) {
       currentBatch = fragmentReader.getCurrentBatch();
-      metricsTracker.addBatchesRead(1);
+      metricsTracker.addNumBatchesLoaded(1);
+      metricsTracker.addNumRowsScanned(currentBatch.numRows());
       metricsTracker.addBatchLoadTimeNs(fragmentReader.getLastBatchLoadTimeNs());
       return true;
     }

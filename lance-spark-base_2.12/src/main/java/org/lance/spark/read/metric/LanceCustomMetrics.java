@@ -16,12 +16,27 @@ package org.lance.spark.read.metric;
 import org.apache.spark.sql.connector.metric.CustomMetric;
 import org.apache.spark.sql.connector.metric.CustomSumMetric;
 
-/** Custom metrics for the Lance read path, displayed on the Spark UI Scan node. */
+/**
+ * Custom metrics for the Lance read path, displayed on the Spark UI Scan node.
+ *
+ * <p>Naming conventions:
+ *
+ * <ul>
+ *   <li>Counters use {@code num*} prefix (e.g. {@code numFragmentsScanned}).
+ *   <li>Durations use {@code *TimeNs} suffix and extend {@link CustomNsTimeMetric} so the UI shows
+ *       formatted values like "1.2 s" instead of raw nanoseconds.
+ *   <li>Sizes use {@code *Bytes} suffix (reserved for future use).
+ * </ul>
+ *
+ * <p>Future metrics gated on upstream {@code lance-jni} surface (not implementable in pure Java
+ * today): {@code numFragmentsPruned}, {@code bytesRead}, {@code numIndexLookups}, {@code
+ * ioWaitTimeNs}, {@code decodeTimeNs}.
+ */
 public final class LanceCustomMetrics {
-  public static final String FRAGMENTS_SCANNED = "fragmentsScanned";
-  public static final String BATCHES_READ = "batchesRead";
+  public static final String NUM_FRAGMENTS_SCANNED = "numFragmentsScanned";
+  public static final String NUM_BATCHES_LOADED = "numBatchesLoaded";
+  public static final String NUM_ROWS_SCANNED = "numRowsScanned";
 
-  public static final String SCAN_TIME_NS = "scanTimeNs";
   public static final String DATASET_OPEN_TIME_NS = "datasetOpenTimeNs";
   public static final String SCANNER_CREATE_TIME_NS = "scannerCreateTimeNs";
   public static final String BATCH_LOAD_TIME_NS = "batchLoadTimeNs";
@@ -30,10 +45,10 @@ public final class LanceCustomMetrics {
 
   // Each inner class MUST have a public no-arg constructor (Spark instantiates via reflection).
 
-  public static class FragmentsScannedMetric extends CustomSumMetric {
+  public static class NumFragmentsScannedMetric extends CustomSumMetric {
     @Override
     public String name() {
-      return FRAGMENTS_SCANNED;
+      return NUM_FRAGMENTS_SCANNED;
     }
 
     @Override
@@ -42,31 +57,31 @@ public final class LanceCustomMetrics {
     }
   }
 
-  public static class BatchesReadMetric extends CustomSumMetric {
+  public static class NumBatchesLoadedMetric extends CustomSumMetric {
     @Override
     public String name() {
-      return BATCHES_READ;
+      return NUM_BATCHES_LOADED;
     }
 
     @Override
     public String description() {
-      return "number of Arrow batches read";
+      return "number of Arrow batches loaded";
     }
   }
 
-  public static class ScanTimeNsMetric extends CustomSumMetric {
+  public static class NumRowsScannedMetric extends CustomSumMetric {
     @Override
     public String name() {
-      return SCAN_TIME_NS;
+      return NUM_ROWS_SCANNED;
     }
 
     @Override
     public String description() {
-      return "total Lance scan time (sum of open + create + load) (ns)";
+      return "number of rows read from storage (before filter evaluation)";
     }
   }
 
-  public static class DatasetOpenTimeNsMetric extends CustomSumMetric {
+  public static class DatasetOpenTimeNsMetric extends CustomNsTimeMetric {
     @Override
     public String name() {
       return DATASET_OPEN_TIME_NS;
@@ -74,11 +89,11 @@ public final class LanceCustomMetrics {
 
     @Override
     public String description() {
-      return "time to open Lance dataset (ns)";
+      return "time to open Lance dataset";
     }
   }
 
-  public static class ScannerCreateTimeNsMetric extends CustomSumMetric {
+  public static class ScannerCreateTimeNsMetric extends CustomNsTimeMetric {
     @Override
     public String name() {
       return SCANNER_CREATE_TIME_NS;
@@ -86,27 +101,26 @@ public final class LanceCustomMetrics {
 
     @Override
     public String description() {
-      return "time to create fragment scanner (ns)";
+      return "time to create fragment scanner";
     }
   }
 
-  public static class BatchLoadTimeNsMetric extends CustomSumMetric {
+  public static class BatchLoadTimeNsMetric extends CustomNsTimeMetric {
     @Override
     public String name() {
       return BATCH_LOAD_TIME_NS;
     }
 
-    // includes JNI + Arrow IPC deserialization (ns)
     @Override
     public String description() {
-      return "time to arrow load batch (ns)";
+      return "time to load Arrow batch (JNI + IPC deserialization)";
     }
   }
 
   private static final CustomMetric[] ALL_METRICS = {
-    new FragmentsScannedMetric(),
-    new BatchesReadMetric(),
-    new ScanTimeNsMetric(),
+    new NumFragmentsScannedMetric(),
+    new NumBatchesLoadedMetric(),
+    new NumRowsScannedMetric(),
     new DatasetOpenTimeNsMetric(),
     new ScannerCreateTimeNsMetric(),
     new BatchLoadTimeNsMetric(),

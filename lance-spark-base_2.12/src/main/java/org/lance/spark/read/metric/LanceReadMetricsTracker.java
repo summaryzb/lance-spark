@@ -20,20 +20,99 @@ import org.apache.spark.sql.connector.metric.CustomTaskMetric;
  * PartitionReader, single-threaded access). Returns snapshot values via {@link
  * #currentMetricsValues()} — Spark calls this once per {@code next()} invocation on the
  * PartitionReader.
+ *
+ * <p>The {@link CustomTaskMetric} array and per-metric instances are allocated once per tracker
+ * (not per call): each {@code value()} invocation reads the current long field directly, so {@code
+ * currentMetricsValues()} is allocation-free on the hot path.
  */
 public class LanceReadMetricsTracker {
-  private long fragmentsScanned;
-  private long batchesRead;
+  private long numFragmentsScanned;
+  private long numBatchesLoaded;
+  private long numRowsScanned;
   private long datasetOpenTimeNs;
   private long scannerCreateTimeNs;
   private long batchLoadTimeNs;
 
-  public void addFragmentsScanned(long n) {
-    fragmentsScanned += n;
+  private final CustomTaskMetric[] taskMetrics =
+      new CustomTaskMetric[] {
+        new CustomTaskMetric() {
+          @Override
+          public String name() {
+            return LanceCustomMetrics.NUM_FRAGMENTS_SCANNED;
+          }
+
+          @Override
+          public long value() {
+            return numFragmentsScanned;
+          }
+        },
+        new CustomTaskMetric() {
+          @Override
+          public String name() {
+            return LanceCustomMetrics.NUM_BATCHES_LOADED;
+          }
+
+          @Override
+          public long value() {
+            return numBatchesLoaded;
+          }
+        },
+        new CustomTaskMetric() {
+          @Override
+          public String name() {
+            return LanceCustomMetrics.NUM_ROWS_SCANNED;
+          }
+
+          @Override
+          public long value() {
+            return numRowsScanned;
+          }
+        },
+        new CustomTaskMetric() {
+          @Override
+          public String name() {
+            return LanceCustomMetrics.DATASET_OPEN_TIME_NS;
+          }
+
+          @Override
+          public long value() {
+            return datasetOpenTimeNs;
+          }
+        },
+        new CustomTaskMetric() {
+          @Override
+          public String name() {
+            return LanceCustomMetrics.SCANNER_CREATE_TIME_NS;
+          }
+
+          @Override
+          public long value() {
+            return scannerCreateTimeNs;
+          }
+        },
+        new CustomTaskMetric() {
+          @Override
+          public String name() {
+            return LanceCustomMetrics.BATCH_LOAD_TIME_NS;
+          }
+
+          @Override
+          public long value() {
+            return batchLoadTimeNs;
+          }
+        },
+      };
+
+  public void addNumFragmentsScanned(long n) {
+    numFragmentsScanned += n;
   }
 
-  public void addBatchesRead(long n) {
-    batchesRead += n;
+  public void addNumBatchesLoaded(long n) {
+    numBatchesLoaded += n;
+  }
+
+  public void addNumRowsScanned(long n) {
+    numRowsScanned += n;
   }
 
   public void addDatasetOpenTimeNs(long ns) {
@@ -50,25 +129,20 @@ public class LanceReadMetricsTracker {
 
   /** Returns current snapshot of all metrics. Called by PartitionReader.currentMetricsValues(). */
   public CustomTaskMetric[] currentMetricsValues() {
-    // Derived metric: must be updated if new timing phases are added
-    long scanTimeNs = datasetOpenTimeNs + scannerCreateTimeNs + batchLoadTimeNs;
-    return new CustomTaskMetric[] {
-      taskMetric(LanceCustomMetrics.FRAGMENTS_SCANNED, fragmentsScanned),
-      taskMetric(LanceCustomMetrics.BATCHES_READ, batchesRead),
-      taskMetric(LanceCustomMetrics.SCAN_TIME_NS, scanTimeNs),
-      taskMetric(LanceCustomMetrics.DATASET_OPEN_TIME_NS, datasetOpenTimeNs),
-      taskMetric(LanceCustomMetrics.SCANNER_CREATE_TIME_NS, scannerCreateTimeNs),
-      taskMetric(LanceCustomMetrics.BATCH_LOAD_TIME_NS, batchLoadTimeNs),
-    };
+    return taskMetrics;
   }
 
   // Accessors for testing
-  public long getFragmentsScanned() {
-    return fragmentsScanned;
+  public long getNumFragmentsScanned() {
+    return numFragmentsScanned;
   }
 
-  public long getBatchesRead() {
-    return batchesRead;
+  public long getNumBatchesLoaded() {
+    return numBatchesLoaded;
+  }
+
+  public long getNumRowsScanned() {
+    return numRowsScanned;
   }
 
   public long getDatasetOpenTimeNs() {
@@ -81,19 +155,5 @@ public class LanceReadMetricsTracker {
 
   public long getBatchLoadTimeNs() {
     return batchLoadTimeNs;
-  }
-
-  private static CustomTaskMetric taskMetric(String name, long value) {
-    return new CustomTaskMetric() {
-      @Override
-      public String name() {
-        return name;
-      }
-
-      @Override
-      public long value() {
-        return value;
-      }
-    };
   }
 }
