@@ -116,9 +116,6 @@ object LanceArrowUtils {
       case ts: ArrowType.Timestamp =>
         if (ts.getTimezone != null && ts.getTimezone.nonEmpty) TimestampType
         else TimestampNTZType
-      // TODO: Date(MILLISECOND), FixedSizeList, and LargeUtf8 metadata is lost for array
-      // elements because fromArrowField returns DataType without metadata. Track as a
-      // known limitation; address in a follow-up.
       case l: ArrowType.List =>
         val children = field.getChildren
         if (children.isEmpty) {
@@ -128,8 +125,6 @@ object LanceArrowUtils {
         val elementType = fromArrowField(elementField)
         val containsNull = elementField.isNullable
         ArrayType(elementType, containsNull)
-      // TODO: Same metadata limitation as List — Date(MILLISECOND) and other
-      // metadata-carrying types lose metadata for map key/value types.
       case _: ArrowType.Map =>
         // Keep map conversion recursive to avoid delegating nested unsupported Arrow types
         // back to Spark ArrowUtils.
