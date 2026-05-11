@@ -60,6 +60,8 @@ public class LanceSparkReadOptions implements Serializable {
   public static final String CONFIG_INDEX_CACHE_SIZE = "index_cache_size";
   public static final String CONFIG_METADATA_CACHE_SIZE = "metadata_cache_size";
   public static final String CONFIG_BATCH_SIZE = "batch_size";
+  public static final String CONFIG_BATCH_READAHEAD = "batch_readahead";
+  public static final String CONFIG_BATCH_PREFETCH_QUEUE_DEPTH = "batch_prefetch_queue_depth";
   public static final String CONFIG_TOP_N_PUSH_DOWN = "topN_push_down";
 
   public static final String CONFIG_NEAREST = "nearest";
@@ -130,6 +132,28 @@ public class LanceSparkReadOptions implements Serializable {
   private static final boolean DEFAULT_PUSH_DOWN_FILTERS = true;
   // Changed from 512 to 8192 for better OLAP scan performance (33x improvement)
   private static final int DEFAULT_BATCH_SIZE = 8192;
+  private static final int DEFAULT_BATCH_READAHEAD = 16;
+
+  /**
+   * Default queue depth for the JVM-side async batch prefetch pipeline in {@code
+   * LanceFragmentScanner.getArrowReader()}. {@code 0} disables the prefetch wrapper entirely (the
+   * synchronous Arrow reader from Lance is used as-is), preserving historical behavior. Set to
+   * {@code >=1} to enable a background thread that overlaps Lance JNI {@code loadNextBatch()} +
+   * buffer-transfer with Spark batch consumption.
+   */
+  private static final int DEFAULT_BATCH_PREFETCH_QUEUE_DEPTH = 0;
+
+  /**
+   * Upper bound accepted for {@code batch_prefetch_queue_depth}. The JVM wrapper only needs to stay
+   * one batch ahead of Spark consumption; values beyond a few dozen add memory pressure without
+   * improving latency hiding. The hard cap at 128 exists to reject absurd configurations (e.g.
+   * {@link Integer#MAX_VALUE}) that would OOME every task when {@link
+   * java.util.concurrent.ArrayBlockingQueue} allocates its backing array. Tune the practical value
+   * per workload via {@code batch_prefetch_queue_depth} itself; this constant is a safety rail, not
+   * a recommendation.
+   */
+  public static final int MAX_BATCH_PREFETCH_QUEUE_DEPTH = 128;
+
   private static final boolean DEFAULT_TOP_N_PUSH_DOWN = true;
   private static final boolean DEFAULT_EXECUTOR_CREDENTIAL_REFRESH = true;
   private static final boolean DEFAULT_RUNTIME_FILTERING_ENABLED = true;
@@ -148,6 +172,8 @@ public class LanceSparkReadOptions implements Serializable {
   private final Integer indexCacheSize;
   private final Integer metadataCacheSize;
   private final int batchSize;
+  private final int batchReadahead;
+  private final int batchPrefetchQueueDepth;
   private transient Query nearest;
   private final boolean topNPushDown;
   private final Map<String, String> storageOptions;
@@ -186,6 +212,8 @@ public class LanceSparkReadOptions implements Serializable {
     this.indexCacheSize = builder.indexCacheSize;
     this.metadataCacheSize = builder.metadataCacheSize;
     this.batchSize = builder.batchSize;
+    this.batchReadahead = builder.batchReadahead;
+    this.batchPrefetchQueueDepth = builder.batchPrefetchQueueDepth;
     this.nearest = builder.nearest;
     this.topNPushDown = builder.topNPushDown;
     this.storageOptions = new HashMap<>(builder.storageOptions);
@@ -305,6 +333,21 @@ public class LanceSparkReadOptions implements Serializable {
     return batchSize;
   }
 
+  public int getBatchReadahead() {
+    return batchReadahead;
+  }
+
+  /**
+   * Returns the configured queue depth for the JVM-side async batch prefetch pipeline. A value of
+   * {@code 0} (default) disables prefetch and the Arrow reader from Lance is returned directly. A
+   * positive value enables a background thread in {@code LanceFragmentScanner.getArrowReader()}
+   * that overlaps Lance JNI {@code loadNextBatch()} + buffer-transfer with Spark batch consumption,
+   * at the cost of one extra in-flight batch per executor task.
+   */
+  public int getBatchPrefetchQueueDepth() {
+    return batchPrefetchQueueDepth;
+  }
+
   public Query getNearest() {
     return nearest;
   }
@@ -396,6 +439,8 @@ public class LanceSparkReadOptions implements Serializable {
         .indexCacheSize(this.indexCacheSize)
         .metadataCacheSize(this.metadataCacheSize)
         .batchSize(this.batchSize)
+        .batchReadahead(this.batchReadahead)
+        .batchPrefetchQueueDepth(this.batchPrefetchQueueDepth)
         .nearest(this.nearest)
         .topNPushDown(this.topNPushDown)
         .storageOptions(this.storageOptions)
@@ -457,6 +502,8 @@ public class LanceSparkReadOptions implements Serializable {
     LanceSparkReadOptions that = (LanceSparkReadOptions) o;
     return pushDownFilters == that.pushDownFilters
         && batchSize == that.batchSize
+        && batchReadahead == that.batchReadahead
+        && batchPrefetchQueueDepth == that.batchPrefetchQueueDepth
         && topNPushDown == that.topNPushDown
         && executorCredentialRefresh == that.executorCredentialRefresh
         && runtimeFilteringEnabled == that.runtimeFilteringEnabled
@@ -485,6 +532,8 @@ public class LanceSparkReadOptions implements Serializable {
         indexCacheSize,
         metadataCacheSize,
         batchSize,
+        batchReadahead,
+        batchPrefetchQueueDepth,
         nearest,
         topNPushDown,
         storageOptions,
@@ -508,6 +557,8 @@ public class LanceSparkReadOptions implements Serializable {
     private Integer indexCacheSize;
     private Integer metadataCacheSize;
     private int batchSize = DEFAULT_BATCH_SIZE;
+    private int batchReadahead = DEFAULT_BATCH_READAHEAD;
+    private int batchPrefetchQueueDepth = DEFAULT_BATCH_PREFETCH_QUEUE_DEPTH;
     private boolean topNPushDown = DEFAULT_TOP_N_PUSH_DOWN;
     private Map<String, String> storageOptions = new HashMap<>();
     private LanceNamespace namespace;
@@ -569,6 +620,25 @@ public class LanceSparkReadOptions implements Serializable {
 
     public Builder batchSize(int batchSize) {
       this.batchSize = batchSize;
+      return this;
+    }
+
+    public Builder batchReadahead(int batchReadahead) {
+      this.batchReadahead = batchReadahead;
+      return this;
+    }
+
+    public Builder batchPrefetchQueueDepth(int batchPrefetchQueueDepth) {
+      // Symmetric with the parser's bound check in parseTypedFlags so the programmatic
+      // builder path cannot bypass MAX_BATCH_PREFETCH_QUEUE_DEPTH. Without this guard,
+      // callers could construct an options instance with a pathological value that later
+      // fails inside LanceFragmentScanner.getArrowReader when ArrayBlockingQueue allocates
+      // a multi-GiB backing array on every task.
+      Preconditions.checkArgument(
+          batchPrefetchQueueDepth >= 0 && batchPrefetchQueueDepth <= MAX_BATCH_PREFETCH_QUEUE_DEPTH,
+          "batch_prefetch_queue_depth must be in [0, %s]",
+          MAX_BATCH_PREFETCH_QUEUE_DEPTH);
+      this.batchPrefetchQueueDepth = batchPrefetchQueueDepth;
       return this;
     }
 
@@ -659,50 +729,6 @@ public class LanceSparkReadOptions implements Serializable {
     public Builder fromOptions(Map<String, String> options) {
       this.storageOptions = new HashMap<>(options);
       parseTypedFlags(options);
-
-      // Runtime filtering (DFP) options: per-scan key wins, SparkConf is fallback.
-      // Kept in fromOptions (not parseTypedFlags) because the resolution checks both layers.
-      String enabledRaw =
-          resolveConfig(
-              options, CONFIG_RUNTIME_FILTERING_ENABLED, SPARK_CONF_RUNTIME_FILTERING_ENABLED);
-      if (enabledRaw != null) {
-        this.runtimeFilteringEnabled = Boolean.parseBoolean(enabledRaw);
-      }
-      String maxColsRaw =
-          resolveConfig(
-              options,
-              CONFIG_RUNTIME_FILTERING_MAX_COLUMNS,
-              SPARK_CONF_RUNTIME_FILTERING_MAX_COLUMNS);
-      parseIntOrWarn(maxColsRaw, CONFIG_RUNTIME_FILTERING_MAX_COLUMNS)
-          .ifPresent(this::runtimeFilteringMaxColumns);
-      String maxBytesRaw =
-          resolveConfig(
-              options,
-              CONFIG_RUNTIME_FILTERING_MAX_STATS_BYTES,
-              SPARK_CONF_RUNTIME_FILTERING_MAX_STATS_BYTES);
-      parseLongOrWarn(maxBytesRaw, CONFIG_RUNTIME_FILTERING_MAX_STATS_BYTES)
-          .ifPresent(this::runtimeFilteringMaxStatsBytes);
-      String parallelismRaw =
-          resolveConfig(
-              options,
-              CONFIG_RUNTIME_FILTERING_LOAD_PARALLELISM,
-              SPARK_CONF_RUNTIME_FILTERING_LOAD_PARALLELISM);
-      parseIntOrWarn(parallelismRaw, CONFIG_RUNTIME_FILTERING_LOAD_PARALLELISM)
-          .ifPresent(this::runtimeFilteringLoadParallelism);
-      String timeoutRaw =
-          resolveConfig(
-              options,
-              CONFIG_RUNTIME_FILTERING_LOAD_TIMEOUT_MS,
-              SPARK_CONF_RUNTIME_FILTERING_LOAD_TIMEOUT_MS);
-      parseLongOrWarn(timeoutRaw, CONFIG_RUNTIME_FILTERING_LOAD_TIMEOUT_MS)
-          .ifPresent(this::runtimeFilteringLoadTimeoutMs);
-      String maxInRaw =
-          resolveConfig(
-              options,
-              CONFIG_RUNTIME_FILTERING_MAX_IN_VALUES,
-              SPARK_CONF_RUNTIME_FILTERING_MAX_IN_VALUES);
-      parseIntOrWarn(maxInRaw, CONFIG_RUNTIME_FILTERING_MAX_IN_VALUES)
-          .ifPresent(this::runtimeFilteringMaxInValues);
       return this;
     }
 
@@ -814,16 +840,71 @@ public class LanceSparkReadOptions implements Serializable {
         Preconditions.checkArgument(parsedBatchSize > 0, "batch_size must be positive");
         this.batchSize = parsedBatchSize;
       }
-      if (opts.containsKey(CONFIG_TOP_N_PUSH_DOWN)) {
-        this.topNPushDown = Boolean.parseBoolean(opts.get(CONFIG_TOP_N_PUSH_DOWN));
-      }
-      if (opts.containsKey(CONFIG_NEAREST)) {
-        nearest(opts.get(CONFIG_NEAREST));
-      }
       if (opts.containsKey(CONFIG_EXECUTOR_CREDENTIAL_REFRESH)) {
         this.executorCredentialRefresh =
             Boolean.parseBoolean(opts.get(CONFIG_EXECUTOR_CREDENTIAL_REFRESH));
       }
+      if (opts.containsKey(CONFIG_TOP_N_PUSH_DOWN)) {
+        this.topNPushDown = Boolean.parseBoolean(opts.get(CONFIG_TOP_N_PUSH_DOWN));
+      }
+      if (opts.containsKey(CONFIG_BATCH_READAHEAD)) {
+        int parsedReadahead = Integer.parseInt(opts.get(CONFIG_BATCH_READAHEAD));
+        Preconditions.checkArgument(parsedReadahead > 0, "batch_readahead must be positive");
+        this.batchReadahead = parsedReadahead;
+      }
+      if (opts.containsKey(CONFIG_BATCH_PREFETCH_QUEUE_DEPTH)) {
+        int parsedQueueDepth = Integer.parseInt(opts.get(CONFIG_BATCH_PREFETCH_QUEUE_DEPTH));
+        Preconditions.checkArgument(
+            parsedQueueDepth >= 0 && parsedQueueDepth <= MAX_BATCH_PREFETCH_QUEUE_DEPTH,
+            "batch_prefetch_queue_depth must be in [0, %s]",
+            MAX_BATCH_PREFETCH_QUEUE_DEPTH);
+        this.batchPrefetchQueueDepth = parsedQueueDepth;
+      }
+      if (opts.containsKey(CONFIG_NEAREST)) {
+        String json = opts.get(CONFIG_NEAREST);
+        nearest(json);
+      }
+      // Runtime filtering (DFP) options: per-scan key wins, SparkConf is fallback.
+      // Kept in fromOptions (not parseTypedFlags) because the resolution checks both layers.
+      String enabledRaw =
+          resolveConfig(
+              opts, CONFIG_RUNTIME_FILTERING_ENABLED, SPARK_CONF_RUNTIME_FILTERING_ENABLED);
+      if (enabledRaw != null) {
+        this.runtimeFilteringEnabled = Boolean.parseBoolean(enabledRaw);
+      }
+      String maxColsRaw =
+          resolveConfig(
+              opts, CONFIG_RUNTIME_FILTERING_MAX_COLUMNS, SPARK_CONF_RUNTIME_FILTERING_MAX_COLUMNS);
+      parseIntOrWarn(maxColsRaw, CONFIG_RUNTIME_FILTERING_MAX_COLUMNS)
+          .ifPresent(this::runtimeFilteringMaxColumns);
+      String maxBytesRaw =
+          resolveConfig(
+              opts,
+              CONFIG_RUNTIME_FILTERING_MAX_STATS_BYTES,
+              SPARK_CONF_RUNTIME_FILTERING_MAX_STATS_BYTES);
+      parseLongOrWarn(maxBytesRaw, CONFIG_RUNTIME_FILTERING_MAX_STATS_BYTES)
+          .ifPresent(this::runtimeFilteringMaxStatsBytes);
+      String parallelismRaw =
+          resolveConfig(
+              opts,
+              CONFIG_RUNTIME_FILTERING_LOAD_PARALLELISM,
+              SPARK_CONF_RUNTIME_FILTERING_LOAD_PARALLELISM);
+      parseIntOrWarn(parallelismRaw, CONFIG_RUNTIME_FILTERING_LOAD_PARALLELISM)
+          .ifPresent(this::runtimeFilteringLoadParallelism);
+      String timeoutRaw =
+          resolveConfig(
+              opts,
+              CONFIG_RUNTIME_FILTERING_LOAD_TIMEOUT_MS,
+              SPARK_CONF_RUNTIME_FILTERING_LOAD_TIMEOUT_MS);
+      parseLongOrWarn(timeoutRaw, CONFIG_RUNTIME_FILTERING_LOAD_TIMEOUT_MS)
+          .ifPresent(this::runtimeFilteringLoadTimeoutMs);
+      String maxInRaw =
+          resolveConfig(
+              opts,
+              CONFIG_RUNTIME_FILTERING_MAX_IN_VALUES,
+              SPARK_CONF_RUNTIME_FILTERING_MAX_IN_VALUES);
+      parseIntOrWarn(maxInRaw, CONFIG_RUNTIME_FILTERING_MAX_IN_VALUES)
+          .ifPresent(this::runtimeFilteringMaxInValues);
     }
 
     public LanceSparkReadOptions build() {

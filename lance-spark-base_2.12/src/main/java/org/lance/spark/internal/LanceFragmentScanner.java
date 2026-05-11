@@ -23,6 +23,7 @@ import org.lance.spark.LanceSparkReadOptions;
 import org.lance.spark.read.LanceInputPartition;
 import org.lance.spark.utils.Utils;
 
+import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
@@ -146,7 +147,37 @@ public class LanceFragmentScanner implements AutoCloseable {
    * @return the arrow reader. The caller is responsible for closing the reader
    */
   public ArrowReader getArrowReader() {
-    return scanner.scanBatches();
+    ArrowReader reader = scanner.scanBatches();
+    int queueDepth = inputPartition.getReadOptions().getBatchPrefetchQueueDepth();
+    if (queueDepth <= 0) {
+      return reader;
+    }
+    // Evaluate LanceRuntime.allocator() BEFORE calling the wrapper ctor so we can
+    // defend against a throw here: first-call-per-JVM lazily constructs a RootAllocator
+    // and can surface IllegalArgumentException from getAllocatorSize() or OOME from the
+    // allocator itself. Any throw before ownership transfers into the ctor leaves `reader`
+    // orphaned (Lance's native ArrowReader holds JNI buffers not reclaimed by GC), so we
+    // must close it here. Wrapping this call in its own try guarantees we only close on
+    // PRE-ownership failures — once the wrapper ctor starts, it owns the delegate and
+    // handles cleanup on its own throw paths (see PrefetchingArrowReader ctor), so a
+    // double-close on a non-idempotent JNI reader is avoided.
+    BufferAllocator parent;
+    try {
+      parent = LanceRuntime.allocator();
+    } catch (RuntimeException | Error e) {
+      try {
+        reader.close();
+      } catch (Exception closeEx) {
+        e.addSuppressed(closeEx);
+      }
+      throw e;
+    }
+    // PrefetchingArrowReader's ctor takes ownership of `reader` and closes it on any
+    // post-ownership failure (schema read, child allocator / empty root creation, thread
+    // start). We therefore must NOT also close `reader` here — Lance's native ArrowReader
+    // is not idempotent under close(), and a second close on a JNI-backed reader can
+    // SIGSEGV on double-free of native buffers.
+    return new PrefetchingArrowReader(reader, queueDepth, parent);
   }
 
   @Override
