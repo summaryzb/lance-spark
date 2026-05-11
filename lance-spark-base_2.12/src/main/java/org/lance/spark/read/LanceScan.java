@@ -19,7 +19,9 @@ import org.lance.spark.LanceSparkReadOptions;
 import org.lance.spark.utils.Optional;
 
 import org.apache.arrow.util.Preconditions;
+import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.connector.catalog.SupportsRead;
 import org.apache.spark.sql.connector.expressions.Expression;
 import org.apache.spark.sql.connector.expressions.FieldReference;
 import org.apache.spark.sql.connector.expressions.NamedReference;
@@ -34,6 +36,7 @@ import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.Statistics;
+import org.apache.spark.sql.connector.read.SupportsMerge;
 import org.apache.spark.sql.connector.read.SupportsReportPartitioning;
 import org.apache.spark.sql.connector.read.SupportsReportStatistics;
 import org.apache.spark.sql.connector.read.SupportsRuntimeV2Filtering;
@@ -41,7 +44,9 @@ import org.apache.spark.sql.connector.read.partitioning.KeyGroupedPartitioning;
 import org.apache.spark.sql.connector.read.partitioning.Partitioning;
 import org.apache.spark.sql.connector.read.partitioning.UnknownPartitioning;
 import org.apache.spark.sql.internal.connector.SupportsMetadata;
+import org.apache.spark.sql.sources.And;
 import org.apache.spark.sql.sources.Filter;
+import org.apache.spark.sql.sources.Or;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 import org.slf4j.Logger;
@@ -63,6 +68,7 @@ import java.util.stream.Stream;
 public class LanceScan
     implements Batch,
         Scan,
+        SupportsMerge,
         SupportsMetadata,
         SupportsReportStatistics,
         SupportsReportPartitioning,
@@ -910,6 +916,120 @@ public class LanceScan
   @Override
   public CustomMetric[] supportedCustomMetrics() {
     return new CustomMetric[] {new FragmentsScannedMetric()};
+  }
+
+  // ---------- SupportsMerge implementation ----------
+
+  /**
+   * Attempts to merge this scan with {@code other} to eliminate redundant I/O when the {@code
+   * MergeScalarSubqueries} optimizer rule detects duplicate scalar subqueries over the same table.
+   *
+   * <p>Two strategies are tried following ParquetScan's pattern:
+   *
+   * <ol>
+   *   <li><b>Relaxed merge</b> — when {@code spark.sql.planMerge.ignorePushedDataFilters} is
+   *       enabled (default): the scans must share the same {@code readOptions} and namespace
+   *       config, and must not have limit/offset/topN/aggregation pushed. Filters are OR-merged.
+   *   <li><b>Strict merge</b> — when the scans have identical pushdowns (filters, limit, topN,
+   *       aggregation), only the schema differs. The merged scan reuses statistics from {@code
+   *       this}.
+   * </ol>
+   */
+  @Override
+  public java.util.Optional<SupportsMerge> mergeWith(SupportsMerge other, SupportsRead table) {
+    if (other == null) {
+      return java.util.Optional.empty();
+    }
+    LanceScan o = (LanceScan) other;
+    if (!similarScan(o)) {
+      return java.util.Optional.empty();
+    }
+    Filter[] newFilters =
+        new Filter[] {
+          new Or(combineFiltersWithAnd(this.pushedFilters), combineFiltersWithAnd(o.pushedFilters))
+        };
+    Optional<String> whereCondition = FilterPushDown.compileFiltersToSqlWhereClause(newFilters);
+    zonemapStats.putAll(o.zonemapStats);
+    return java.util.Optional.of(
+        new LanceScan(
+            schema.merge(o.schema, true),
+            readOptions,
+            whereCondition,
+            limit,
+            offset,
+            topNSortOrders,
+            pushedAggregation,
+            newFilters,
+            statistics,
+            zonemapStats,
+            null,
+            partitionInfo,
+            initialStorageOptions,
+            namespaceImpl,
+            namespaceProperties));
+  }
+
+  /**
+   * Relaxed compatibility: same dataset and namespace config, no limit/offset/topN/aggregation on
+   * either side. Filters may differ.
+   */
+  private boolean similarScan(LanceScan other) {
+    if (this == other) {
+      return true;
+    }
+    if (getClass() != other.getClass()) {
+      return false;
+    }
+    return Objects.equals(readOptions, other.readOptions)
+        && !offset.isPresent()
+        && !other.offset.isPresent()
+        && !topNSortOrders.isPresent()
+        && !other.topNSortOrders.isPresent()
+        && !pushedAggregation.isPresent()
+        && !other.pushedAggregation.isPresent()
+        && Objects.equals(namespaceImpl, other.namespaceImpl)
+        && Objects.equals(namespaceProperties, other.namespaceProperties)
+        && (isIgnorePushedDataFiltersEnabled()
+            ? similarPartition(other)
+            : equivalentFilters(pushedFilters, other.pushedFilters));
+  }
+
+  private boolean similarPartition(LanceScan other) {
+    if (this.partitionInfo == null && other.partitionInfo == null) {
+      return true;
+    }
+    if (this.partitionInfo != null && other.partitionInfo != null) {
+      return partitionInfo.getColumnName().equals(other.partitionInfo.getColumnName());
+    }
+    return false;
+  }
+
+  /** Reduces a filter array to a single {@link And} tree. */
+  private static Filter combineFiltersWithAnd(Filter[] filters) {
+    if (filters.length == 0) {
+      throw new IllegalArgumentException("Cannot combine zero filters");
+    }
+    Filter result = filters[0];
+    for (int i = 1; i < filters.length; i++) {
+      result = new And(result, filters[i]);
+    }
+    return result;
+  }
+
+  /**
+   * Reads {@code spark.sql.planMerge.ignorePushedDataFilters} from the active SparkSession.
+   * Defaults to {@code true}.
+   */
+  private static boolean isIgnorePushedDataFiltersEnabled() {
+    try {
+      return SparkSession.active()
+          .conf()
+          .get("spark.sql.planMerge.ignorePushedDataFilters", "true")
+          .equalsIgnoreCase("true");
+    } catch (Exception e) {
+      // No active session (e.g., unit test) — use default
+      return true;
+    }
   }
 
   /**
