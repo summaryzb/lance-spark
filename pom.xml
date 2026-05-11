@@ -65,7 +65,7 @@
         <arrow18.version>18.1.0</arrow18.version>
         <arrow183.version>18.3.0</arrow183.version>
         <!-- Default Arrow version (Spark 3.5); modules override as needed -->
-        <arrow.version>${arrow15.version}</arrow.version>
+        <arrow.version>${arrow18.version}</arrow.version>
 
         <antlr4.version>4.9.3</antlr4.version>
 
@@ -73,7 +73,7 @@
         <spark35.version>3.5.5</spark35.version>
         <spark40.version>4.0.0</spark40.version>
         <spark41.version>4.1.1</spark41.version>
-        <spark.version>${spark35.version}</spark.version>
+        <spark.version>${spark40.version}</spark.version>
 
         <spark34.compat.version>3.4</spark34.compat.version>
         <spark35.compat.version>3.5</spark35.compat.version>
@@ -83,11 +83,11 @@
 
         <scala212.version>2.12.20</scala212.version>
         <scala213.version>2.13.16</scala213.version>
-        <scala.version>${scala212.version}</scala.version>
+        <scala.version>${scala213.version}</scala.version>
 
         <scala212.compat.version>2.12</scala212.compat.version>
         <scala213.compat.version>2.13</scala213.compat.version>
-        <scala.compat.version>${scala212.compat.version}</scala.compat.version>
+        <scala.compat.version>${scala213.compat.version}</scala.compat.version>
 
         <spotless.skip>false</spotless.skip>
         <spotless.version>2.43.0</spotless.version>
@@ -130,7 +130,7 @@
         <maven-surefire-plugin.version>3.2.5</maven-surefire-plugin.version>
         <java11.release>11</java11.release>
         <java17.release>17</java17.release>
-        <java.release>${java11.release}</java.release>
+        <java.release>${java17.release}</java.release>
     </properties>
 
     <modules>

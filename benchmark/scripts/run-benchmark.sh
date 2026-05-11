@@ -22,8 +22,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BENCHMARK_DIR="${SCRIPT_DIR}/.."
 
 # Configurable Spark/Scala versions (override via environment)
-SPARK_VERSION="${SPARK_VERSION:-3.5}"
-SCALA_VERSION="${SCALA_VERSION:-2.12}"
+SPARK_VERSION="${SPARK_VERSION:-4.0}"
+SCALA_VERSION="${SCALA_VERSION:-2.13}"
 
 FORMATS="${1:-lance,parquet}"
 SPARK_MASTER="${2:-local[*]}"

@@ -103,6 +103,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
     if (namespace != null && namespace.length > 0) {
       String firstPart = namespace[0];
       if (firstPart.contains("/")
+          || firstPart.startsWith("bos://")
           || firstPart.startsWith("s3://")
           || firstPart.startsWith("gs://")
           || firstPart.startsWith("az://")
@@ -116,6 +117,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
     // Check if name looks like an absolute path
     String name = ident.name();
     return name.startsWith("/")
+        || name.startsWith("bos://")
         || name.startsWith("s3://")
         || name.startsWith("gs://")
         || name.startsWith("az://")

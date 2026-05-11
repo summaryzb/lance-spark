@@ -12,8 +12,8 @@
 
 # Version parameters (can be overridden from command line)
 # Example: make install SPARK_VERSION=3.5 SCALA_VERSION=2.13
-SPARK_VERSION ?= 3.5
-SCALA_VERSION ?= 2.12
+SPARK_VERSION ?= 4.0
+SCALA_VERSION ?= 2.13
 
 # Derived module names
 MODULE := lance-spark-$(SPARK_VERSION)_$(SCALA_VERSION)

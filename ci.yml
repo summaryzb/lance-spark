@@ -1,0 +1,41 @@
+Global:
+  version: 2.0
+
+Default:
+  profile: [compile]
+
+Profiles:
+  - profile:
+    name: compile
+    mode: AGENT
+    environment:
+      image: DECK_STD_CENTOS7
+      resourceType: SMALL
+    build:
+      command: sh build.sh compile
+      cache:
+        enable: true
+        trimeThresholdSize: 3
+        paths:
+          - packages
+          - cache
+    artifacts:
+      release: false
+
+  - profile:
+    name: deploy
+    mode: AGENT
+    environment:
+      image: DECK_STD_CENTOS7
+      resourceType: SMALL
+    build:
+      command: sh build.sh deploy
+      cache:
+        enable: true
+        trimeThresholdSize: 3
+        paths:
+          - packages
+          - cache
+    artifacts:
+      release: false
+
