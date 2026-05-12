@@ -71,6 +71,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static org.lance.spark.utils.Utils.createPathBasedReadOptions;
 import static org.lance.spark.utils.Utils.createReadOptions;
 
 public abstract class BaseLanceNamespaceSparkCatalog
@@ -527,7 +528,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
   private boolean tableExistsAtPath(Identifier ident) {
     String datasetUri = getDatasetUri(ident);
     LanceSparkReadOptions readOptions =
-        createReadOptions(
+        createPathBasedReadOptions(
             datasetUri, catalogConfig, Optional.empty(), Optional.empty(), Optional.empty(), name);
     try (Dataset dataset = Utils.openDatasetBuilder(readOptions).build()) {
       return true;
@@ -609,6 +610,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
             Optional.empty(),
             Optional.of(namespace),
             Optional.of(tableIdList),
+            Optional.ofNullable(initialStorageOptions),
             name);
     return createDataset(
         readOptions,
@@ -632,7 +634,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
 
     StructType processedSchema = SchemaConverter.processSchemaWithProperties(schema, properties);
     LanceSparkReadOptions readOptions =
-        createReadOptions(
+        createPathBasedReadOptions(
             datasetUri, catalogConfig, Optional.empty(), Optional.empty(), Optional.empty(), name);
 
     String fileFormatVersion = catalogConfig.getFileFormatVersion(properties);
@@ -848,6 +850,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
             Optional.empty(),
             Optional.of(namespace),
             Optional.of(tableIdList),
+            Optional.ofNullable(initialStorageOptions),
             name);
 
     Schema arrowSchema = LanceArrowUtils.toArrowSchema(processedSchema, "UTC", true);
@@ -881,7 +884,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
     StructType processedSchema = SchemaConverter.processSchemaWithProperties(schema, properties);
 
     LanceSparkReadOptions readOptions =
-        createReadOptions(
+        createPathBasedReadOptions(
             datasetUri, catalogConfig, Optional.empty(), Optional.empty(), Optional.empty(), name);
 
     Schema arrowSchema = LanceArrowUtils.toArrowSchema(processedSchema, "UTC", true);
@@ -955,7 +958,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
     StructType processedSchema = SchemaConverter.processSchemaWithProperties(schema, properties);
 
     LanceSparkReadOptions readOptions =
-        createReadOptions(
+        createPathBasedReadOptions(
             datasetUri, catalogConfig, Optional.empty(), Optional.empty(), Optional.empty(), name);
 
     Dataset ds;
@@ -1035,6 +1038,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
             Optional.empty(),
             Optional.of(namespace),
             Optional.of(tableIdList),
+            Optional.ofNullable(initialStorageOptions),
             name);
 
     Schema arrowSchema = LanceArrowUtils.toArrowSchema(processedSchema, "UTC", true);
@@ -1078,7 +1082,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
     StructType processedSchema = SchemaConverter.processSchemaWithProperties(schema, properties);
 
     LanceSparkReadOptions readOptions =
-        createReadOptions(
+        createPathBasedReadOptions(
             datasetUri, catalogConfig, Optional.empty(), Optional.empty(), Optional.empty(), name);
 
     boolean exists = tableExistsAtPath(ident);
@@ -1143,7 +1147,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
     if (isPathBasedIdentifier(ident)) {
       String datasetUri = getDatasetUri(ident);
       LanceSparkReadOptions readOptions =
-          createReadOptions(
+          createPathBasedReadOptions(
               datasetUri,
               catalogConfig,
               Optional.empty(),
@@ -1171,6 +1175,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
             Optional.empty(),
             Optional.of(namespace),
             Optional.of(tableIdList),
+            Optional.ofNullable(describeResponse.getStorageOptions()),
             name);
     return new ResolvedTable(readOptions, describeResponse, tableIdList);
   }
@@ -1328,6 +1333,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
               versionId,
               Optional.of(namespace),
               Optional.of(resolved.tableIdList),
+              Optional.ofNullable(initialStorageOptions),
               name);
     } else {
       readOptions = resolved.readOptions;
@@ -1394,7 +1400,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
       versionId = Optional.of(Utils.parseVersion(version.get()));
     } else if (timestamp.isPresent()) {
       LanceSparkReadOptions readOptions =
-          createReadOptions(
+          createPathBasedReadOptions(
               datasetUri,
               catalogConfig,
               Optional.empty(),
@@ -1409,7 +1415,7 @@ public abstract class BaseLanceNamespaceSparkCatalog
     }
 
     LanceSparkReadOptions readOptions =
-        createReadOptions(
+        createPathBasedReadOptions(
             datasetUri, catalogConfig, versionId, Optional.empty(), Optional.empty(), name);
 
     // Read schema, file format version, and config from the dataset
