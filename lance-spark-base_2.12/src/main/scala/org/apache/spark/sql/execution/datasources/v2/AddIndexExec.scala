@@ -32,7 +32,7 @@ import org.lance.index.scalar.{BTreeIndexParams, ScalarIndexParams}
 import org.lance.operation.{CreateIndex => AddIndexOperation}
 import org.lance.spark.{BaseLanceNamespaceSparkCatalog, LanceDataset, LanceRuntime, LanceSparkReadOptions}
 import org.lance.spark.arrow.LanceArrowWriter
-import org.lance.spark.utils.{CloseableUtil, Utils}
+import org.lance.spark.utils.{CloseableUtil, ParserUtils, Utils}
 import org.lance.spark.write.SingleBatchArrowReader
 
 import java.time.Instant
@@ -393,14 +393,16 @@ class RangeBasedBTreeIndexJob(
     val columns = addIndexExec.columns.toList
     val zoneSize = addIndexExec.args.find(_.name == "zone_size").map(_.value.asInstanceOf[Long])
 
-    // Build a fully qualified table name to read data back through Spark.
+    // Build a fully qualified table name to read data back through Spark. Every segment is
+    // backtick-quoted so that Spark's multipart identifier parser does not split on dots,
+    // hyphens, or other special characters inside catalog/namespace/table names.
     val namespace = Option(ident.namespace()).map(_.toSeq).getOrElse(Seq.empty)
-    val parts = if (namespace.isEmpty) {
+    val rawParts = if (namespace.isEmpty) {
       Seq(catalog.name(), ident.name())
     } else {
       catalog.name() +: namespace :+ ident.name()
     }
-    val fullTableName = parts.mkString(".")
+    val fullTableName = rawParts.map(ParserUtils.quoteIdentifier).mkString(".")
 
     // Read specific column and _rowid from dataset
     val df = session.table(fullTableName)

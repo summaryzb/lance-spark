@@ -17,7 +17,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-/** Unit tests for {@link ParserUtils#cleanIdentifier}. */
+/** Unit tests for {@link ParserUtils#cleanIdentifier} and {@link ParserUtils#quoteIdentifier}. */
 public class ParserUtilsTest {
 
   @Test
@@ -77,5 +77,46 @@ public class ParserUtilsTest {
   @Test
   public void testNullInput() {
     assertNull(ParserUtils.cleanIdentifier(null));
+  }
+
+  @Test
+  public void testQuoteBareIdentifier() {
+    assertEquals("`my_table`", ParserUtils.quoteIdentifier("my_table"));
+  }
+
+  @Test
+  public void testQuoteIdentifierWithDots() {
+    assertEquals("`schema.table`", ParserUtils.quoteIdentifier("schema.table"));
+  }
+
+  @Test
+  public void testQuoteEmptyString() {
+    assertEquals("``", ParserUtils.quoteIdentifier(""));
+  }
+
+  @Test
+  public void testQuoteAlreadyQuotedIsIdempotent() {
+    assertEquals("`my_table`", ParserUtils.quoteIdentifier("`my_table`"));
+  }
+
+  @Test
+  public void testQuoteAlreadyQuotedEmpty() {
+    assertEquals("``", ParserUtils.quoteIdentifier("``"));
+  }
+
+  @Test
+  public void testQuoteUnbalancedLeadingBacktickThrows() {
+    assertThrows(IllegalArgumentException.class, () -> ParserUtils.quoteIdentifier("`my_table"));
+  }
+
+  @Test
+  public void testQuoteUnbalancedTrailingBacktickThrows() {
+    assertThrows(IllegalArgumentException.class, () -> ParserUtils.quoteIdentifier("my_table`"));
+  }
+
+  @Test
+  public void testQuoteSingleBacktickThrows() {
+    // Single backtick: starts and ends with `, but length < 2 — treated as unbalanced.
+    assertThrows(IllegalArgumentException.class, () -> ParserUtils.quoteIdentifier("`"));
   }
 }

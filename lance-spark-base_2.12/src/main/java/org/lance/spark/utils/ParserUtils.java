@@ -34,4 +34,26 @@ public final class ParserUtils {
     }
     return text;
   }
+
+  /**
+   * Backtick-quotes an identifier for use in a Spark multipart identifier string. Idempotent: if
+   * the input is already surrounded by backticks it is returned unchanged. Throws when the input
+   * has an unbalanced leading or trailing backtick.
+   *
+   * @param identifier a bare or already-quoted identifier
+   * @return the backtick-quoted identifier
+   * @throws IllegalArgumentException if the identifier has a backtick on only one side
+   */
+  public static String quoteIdentifier(String identifier) {
+    boolean startsWithBacktick = identifier.startsWith("`");
+    boolean endsWithBacktick = identifier.endsWith("`");
+    if (identifier.length() >= 2 && startsWithBacktick && endsWithBacktick) {
+      return identifier;
+    }
+    if (startsWithBacktick || endsWithBacktick) {
+      throw new IllegalArgumentException(
+          "Malformed identifier (unbalanced backticks): " + identifier);
+    }
+    return "`" + identifier + "`";
+  }
 }
