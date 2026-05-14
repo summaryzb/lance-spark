@@ -40,10 +40,13 @@ import org.apache.spark.sql.SparkSession;
  */
 public class TpcdsIndexBuilder {
 
-  /** Table names in priority order (highest-impact tables first). */
+  /** Table names in priority order (highest-impact tables first). Dimension tables come first
+   *  because their indexes serve both static filter pushdown and SPJ; the fact-side
+   *  {@code store_sales} index is the one DFP needs for runtime fragment pruning on star-schema
+   *  joins. */
   private static final String[] TABLE_NAMES = {
       "date_dim", "item", "customer_demographics", "store", "promotion",
-      "customer_address", "household_demographics"
+      "customer_address", "household_demographics", "store_sales"
   };
 
   public static void main(String[] args) throws Exception {

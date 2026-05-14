@@ -85,6 +85,9 @@ fi
 if [ -n "${QUERIES:-}" ]; then
   BENCHMARK_EXTRA_ARGS="${BENCHMARK_EXTRA_ARGS} --queries ${QUERIES}"
 fi
+if [ -n "${DFP_MODE:-}" ]; then
+  BENCHMARK_EXTRA_ARGS="${BENCHMARK_EXTRA_ARGS} --dfp-mode ${DFP_MODE}"
+fi
 
 ${SPARK_SUBMIT} \
   --class org.lance.spark.benchmark.TpcdsBenchmarkRunner \

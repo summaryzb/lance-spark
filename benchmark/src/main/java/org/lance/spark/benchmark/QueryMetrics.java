@@ -25,6 +25,10 @@ public class QueryMetrics {
   private long shuffleWriteBytes;
   private int numTasks;
   private int numStages;
+  // Lance custom metric: fragments actually opened by PartitionReaders. -1 means "not observed"
+  // (e.g. non-Lance scan, or scan has no supportedCustomMetrics). Populated post-execution by
+  // walking executedPlan and summing per-BatchScanExec "fragmentsScanned" SQLMetric values.
+  private long lanceFragmentsScanned = -1L;
 
   public long getTotalTaskTimeMs() {
     return totalTaskTimeMs;
@@ -106,15 +110,28 @@ public class QueryMetrics {
     this.numStages = numStages;
   }
 
+  public long getLanceFragmentsScanned() {
+    return lanceFragmentsScanned;
+  }
+
+  public void setLanceFragmentsScanned(long lanceFragmentsScanned) {
+    this.lanceFragmentsScanned = lanceFragmentsScanned;
+  }
+
   public String toSummaryString() {
-    return String.format(
-        "tasks=%d cpu=%dms gc=%dms read=%s shuffle_r=%s shuffle_w=%s",
-        numTasks,
-        executorCpuTimeNs / 1_000_000,
-        jvmGcTimeMs,
-        formatBytes(bytesRead),
-        formatBytes(shuffleReadBytes),
-        formatBytes(shuffleWriteBytes));
+    String base =
+        String.format(
+            "tasks=%d cpu=%dms gc=%dms read=%s shuffle_r=%s shuffle_w=%s",
+            numTasks,
+            executorCpuTimeNs / 1_000_000,
+            jvmGcTimeMs,
+            formatBytes(bytesRead),
+            formatBytes(shuffleReadBytes),
+            formatBytes(shuffleWriteBytes));
+    if (lanceFragmentsScanned >= 0) {
+      base += " fragments=" + lanceFragmentsScanned;
+    }
+    return base;
   }
 
   private static String formatBytes(long bytes) {
@@ -141,11 +158,13 @@ public class QueryMetrics {
         String.valueOf(recordsRead),
         String.valueOf(bytesWritten),
         String.valueOf(shuffleReadBytes),
-        String.valueOf(shuffleWriteBytes));
+        String.valueOf(shuffleWriteBytes),
+        String.valueOf(lanceFragmentsScanned));
   }
 
   public static String csvHeaderFragment() {
     return "num_tasks,num_stages,total_task_time_ms,cpu_time_ms,gc_time_ms,"
-        + "bytes_read,records_read,bytes_written,shuffle_read_bytes,shuffle_write_bytes";
+        + "bytes_read,records_read,bytes_written,shuffle_read_bytes,shuffle_write_bytes,"
+        + "lance_fragments_scanned";
   }
 }

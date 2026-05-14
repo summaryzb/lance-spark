@@ -19,6 +19,8 @@ import org.lance.namespace.LanceNamespace;
 import org.lance.spark.utils.QueryUtils;
 
 import com.google.common.base.Preconditions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.ObjectInputStream;
@@ -48,6 +50,8 @@ import java.util.Objects;
  */
 public class LanceSparkReadOptions implements Serializable {
   private static final long serialVersionUID = 1L;
+
+  private static final Logger LOG = LoggerFactory.getLogger(LanceSparkReadOptions.class);
 
   public static final String CONFIG_DATASET_URI = "path";
   public static final String CONFIG_PUSH_DOWN_FILTERS = "pushDownFilters";
@@ -96,11 +100,44 @@ public class LanceSparkReadOptions implements Serializable {
 
   public static final String LANCE_FILE_SUFFIX = ".lance";
 
+  // --- Dynamic File Pruning (DFP) / runtime filtering options ---
+  // Per-scan keys (used with .option("...") and OPTIONS (...))
+  public static final String CONFIG_RUNTIME_FILTERING_ENABLED = "lance.runtime.filtering.enabled";
+  public static final String CONFIG_RUNTIME_FILTERING_MAX_COLUMNS =
+      "lance.runtime.filtering.max.columns";
+  public static final String CONFIG_RUNTIME_FILTERING_MAX_STATS_BYTES =
+      "lance.runtime.filtering.max.stats.bytes";
+  public static final String CONFIG_RUNTIME_FILTERING_LOAD_PARALLELISM =
+      "lance.runtime.filtering.load.parallelism";
+  public static final String CONFIG_RUNTIME_FILTERING_LOAD_TIMEOUT_MS =
+      "lance.runtime.filtering.load.timeout.ms";
+  public static final String CONFIG_RUNTIME_FILTERING_MAX_IN_VALUES =
+      "lance.runtime.filtering.max.in.values";
+  // SparkConf fallback keys (session-wide), consulted when per-scan options are absent.
+  public static final String SPARK_CONF_RUNTIME_FILTERING_ENABLED =
+      "spark.lance.runtime.filtering.enabled";
+  public static final String SPARK_CONF_RUNTIME_FILTERING_MAX_COLUMNS =
+      "spark.lance.runtime.filtering.max.columns";
+  public static final String SPARK_CONF_RUNTIME_FILTERING_MAX_STATS_BYTES =
+      "spark.lance.runtime.filtering.max.stats.bytes";
+  public static final String SPARK_CONF_RUNTIME_FILTERING_LOAD_PARALLELISM =
+      "spark.lance.runtime.filtering.load.parallelism";
+  public static final String SPARK_CONF_RUNTIME_FILTERING_LOAD_TIMEOUT_MS =
+      "spark.lance.runtime.filtering.load.timeout.ms";
+  public static final String SPARK_CONF_RUNTIME_FILTERING_MAX_IN_VALUES =
+      "spark.lance.runtime.filtering.max.in.values";
+
   private static final boolean DEFAULT_PUSH_DOWN_FILTERS = true;
   // Changed from 512 to 8192 for better OLAP scan performance (33x improvement)
   private static final int DEFAULT_BATCH_SIZE = 8192;
   private static final boolean DEFAULT_TOP_N_PUSH_DOWN = true;
   private static final boolean DEFAULT_EXECUTOR_CREDENTIAL_REFRESH = true;
+  private static final boolean DEFAULT_RUNTIME_FILTERING_ENABLED = true;
+  private static final int DEFAULT_RUNTIME_FILTERING_MAX_COLUMNS = 20;
+  private static final long DEFAULT_RUNTIME_FILTERING_MAX_STATS_BYTES = 64L * 1024L * 1024L;
+  private static final int DEFAULT_RUNTIME_FILTERING_LOAD_PARALLELISM = 4;
+  private static final long DEFAULT_RUNTIME_FILTERING_LOAD_TIMEOUT_MS = 5000L;
+  private static final int DEFAULT_RUNTIME_FILTERING_MAX_IN_VALUES = 10000;
 
   private final String datasetUri;
   private final String dbPath;
@@ -130,6 +167,14 @@ public class LanceSparkReadOptions implements Serializable {
    */
   private final boolean executorCredentialRefresh;
 
+  // --- Dynamic File Pruning (DFP) options ---
+  private final boolean runtimeFilteringEnabled;
+  private final int runtimeFilteringMaxColumns;
+  private final long runtimeFilteringMaxStatsBytes;
+  private final int runtimeFilteringLoadParallelism;
+  private final long runtimeFilteringLoadTimeoutMs;
+  private final int runtimeFilteringMaxInValues;
+
   private LanceSparkReadOptions(Builder builder) {
     this.datasetUri = builder.datasetUri;
     String[] paths = extractDbPathAndDatasetName(datasetUri);
@@ -148,6 +193,12 @@ public class LanceSparkReadOptions implements Serializable {
     this.tableId = builder.tableId;
     this.catalogName = builder.catalogName;
     this.executorCredentialRefresh = builder.executorCredentialRefresh;
+    this.runtimeFilteringEnabled = builder.runtimeFilteringEnabled;
+    this.runtimeFilteringMaxColumns = builder.runtimeFilteringMaxColumns;
+    this.runtimeFilteringMaxStatsBytes = builder.runtimeFilteringMaxStatsBytes;
+    this.runtimeFilteringLoadParallelism = builder.runtimeFilteringLoadParallelism;
+    this.runtimeFilteringLoadTimeoutMs = builder.runtimeFilteringLoadTimeoutMs;
+    this.runtimeFilteringMaxInValues = builder.runtimeFilteringMaxInValues;
   }
 
   /** Creates a new builder for LanceSparkReadOptions. */
@@ -295,6 +346,30 @@ public class LanceSparkReadOptions implements Serializable {
     return namespace != null && tableId != null;
   }
 
+  public boolean isRuntimeFilteringEnabled() {
+    return runtimeFilteringEnabled;
+  }
+
+  public int getRuntimeFilteringMaxColumns() {
+    return runtimeFilteringMaxColumns;
+  }
+
+  public long getRuntimeFilteringMaxStatsBytes() {
+    return runtimeFilteringMaxStatsBytes;
+  }
+
+  public int getRuntimeFilteringLoadParallelism() {
+    return runtimeFilteringLoadParallelism;
+  }
+
+  public long getRuntimeFilteringLoadTimeoutMs() {
+    return runtimeFilteringLoadTimeoutMs;
+  }
+
+  public int getRuntimeFilteringMaxInValues() {
+    return runtimeFilteringMaxInValues;
+  }
+
   /**
    * Sets the namespace for this options. Used after deserialization to restore the namespace.
    *
@@ -328,6 +403,12 @@ public class LanceSparkReadOptions implements Serializable {
         .tableId(this.tableId)
         .catalogName(this.catalogName)
         .executorCredentialRefresh(this.executorCredentialRefresh)
+        .runtimeFilteringEnabled(this.runtimeFilteringEnabled)
+        .runtimeFilteringMaxColumns(this.runtimeFilteringMaxColumns)
+        .runtimeFilteringMaxStatsBytes(this.runtimeFilteringMaxStatsBytes)
+        .runtimeFilteringLoadParallelism(this.runtimeFilteringLoadParallelism)
+        .runtimeFilteringLoadTimeoutMs(this.runtimeFilteringLoadTimeoutMs)
+        .runtimeFilteringMaxInValues(this.runtimeFilteringMaxInValues)
         .build();
   }
 
@@ -378,6 +459,12 @@ public class LanceSparkReadOptions implements Serializable {
         && batchSize == that.batchSize
         && topNPushDown == that.topNPushDown
         && executorCredentialRefresh == that.executorCredentialRefresh
+        && runtimeFilteringEnabled == that.runtimeFilteringEnabled
+        && runtimeFilteringMaxColumns == that.runtimeFilteringMaxColumns
+        && runtimeFilteringMaxStatsBytes == that.runtimeFilteringMaxStatsBytes
+        && runtimeFilteringLoadParallelism == that.runtimeFilteringLoadParallelism
+        && runtimeFilteringLoadTimeoutMs == that.runtimeFilteringLoadTimeoutMs
+        && runtimeFilteringMaxInValues == that.runtimeFilteringMaxInValues
         && Objects.equals(nearest, that.nearest)
         && Objects.equals(datasetUri, that.datasetUri)
         && Objects.equals(blockSize, that.blockSize)
@@ -402,7 +489,13 @@ public class LanceSparkReadOptions implements Serializable {
         topNPushDown,
         storageOptions,
         tableId,
-        executorCredentialRefresh);
+        executorCredentialRefresh,
+        runtimeFilteringEnabled,
+        runtimeFilteringMaxColumns,
+        runtimeFilteringMaxStatsBytes,
+        runtimeFilteringLoadParallelism,
+        runtimeFilteringLoadTimeoutMs,
+        runtimeFilteringMaxInValues);
   }
 
   /** Builder for creating LanceSparkReadOptions instances. */
@@ -421,6 +514,12 @@ public class LanceSparkReadOptions implements Serializable {
     private List<String> tableId;
     private String catalogName;
     private boolean executorCredentialRefresh = DEFAULT_EXECUTOR_CREDENTIAL_REFRESH;
+    private boolean runtimeFilteringEnabled = DEFAULT_RUNTIME_FILTERING_ENABLED;
+    private int runtimeFilteringMaxColumns = DEFAULT_RUNTIME_FILTERING_MAX_COLUMNS;
+    private long runtimeFilteringMaxStatsBytes = DEFAULT_RUNTIME_FILTERING_MAX_STATS_BYTES;
+    private int runtimeFilteringLoadParallelism = DEFAULT_RUNTIME_FILTERING_LOAD_PARALLELISM;
+    private long runtimeFilteringLoadTimeoutMs = DEFAULT_RUNTIME_FILTERING_LOAD_TIMEOUT_MS;
+    private int runtimeFilteringMaxInValues = DEFAULT_RUNTIME_FILTERING_MAX_IN_VALUES;
 
     private Builder() {}
 
@@ -503,6 +602,54 @@ public class LanceSparkReadOptions implements Serializable {
       return this;
     }
 
+    public Builder runtimeFilteringEnabled(boolean runtimeFilteringEnabled) {
+      this.runtimeFilteringEnabled = runtimeFilteringEnabled;
+      return this;
+    }
+
+    public Builder runtimeFilteringMaxColumns(int runtimeFilteringMaxColumns) {
+      Preconditions.checkArgument(
+          runtimeFilteringMaxColumns >= 0, "%s must be >= 0", CONFIG_RUNTIME_FILTERING_MAX_COLUMNS);
+      this.runtimeFilteringMaxColumns = runtimeFilteringMaxColumns;
+      return this;
+    }
+
+    public Builder runtimeFilteringMaxStatsBytes(long runtimeFilteringMaxStatsBytes) {
+      Preconditions.checkArgument(
+          runtimeFilteringMaxStatsBytes >= 0,
+          "%s must be >= 0",
+          CONFIG_RUNTIME_FILTERING_MAX_STATS_BYTES);
+      this.runtimeFilteringMaxStatsBytes = runtimeFilteringMaxStatsBytes;
+      return this;
+    }
+
+    public Builder runtimeFilteringLoadParallelism(int runtimeFilteringLoadParallelism) {
+      Preconditions.checkArgument(
+          runtimeFilteringLoadParallelism >= 1,
+          "%s must be >= 1",
+          CONFIG_RUNTIME_FILTERING_LOAD_PARALLELISM);
+      this.runtimeFilteringLoadParallelism = runtimeFilteringLoadParallelism;
+      return this;
+    }
+
+    public Builder runtimeFilteringLoadTimeoutMs(long runtimeFilteringLoadTimeoutMs) {
+      Preconditions.checkArgument(
+          runtimeFilteringLoadTimeoutMs > 0,
+          "%s must be > 0",
+          CONFIG_RUNTIME_FILTERING_LOAD_TIMEOUT_MS);
+      this.runtimeFilteringLoadTimeoutMs = runtimeFilteringLoadTimeoutMs;
+      return this;
+    }
+
+    public Builder runtimeFilteringMaxInValues(int runtimeFilteringMaxInValues) {
+      Preconditions.checkArgument(
+          runtimeFilteringMaxInValues >= 0,
+          "%s must be >= 0",
+          CONFIG_RUNTIME_FILTERING_MAX_IN_VALUES);
+      this.runtimeFilteringMaxInValues = runtimeFilteringMaxInValues;
+      return this;
+    }
+
     /**
      * Parses options from a map, extracting read-specific settings.
      *
@@ -512,7 +659,115 @@ public class LanceSparkReadOptions implements Serializable {
     public Builder fromOptions(Map<String, String> options) {
       this.storageOptions = new HashMap<>(options);
       parseTypedFlags(options);
+
+      // Runtime filtering (DFP) options: per-scan key wins, SparkConf is fallback.
+      // Kept in fromOptions (not parseTypedFlags) because the resolution checks both layers.
+      String enabledRaw =
+          resolveConfig(
+              options, CONFIG_RUNTIME_FILTERING_ENABLED, SPARK_CONF_RUNTIME_FILTERING_ENABLED);
+      if (enabledRaw != null) {
+        this.runtimeFilteringEnabled = Boolean.parseBoolean(enabledRaw);
+      }
+      String maxColsRaw =
+          resolveConfig(
+              options,
+              CONFIG_RUNTIME_FILTERING_MAX_COLUMNS,
+              SPARK_CONF_RUNTIME_FILTERING_MAX_COLUMNS);
+      parseIntOrWarn(maxColsRaw, CONFIG_RUNTIME_FILTERING_MAX_COLUMNS)
+          .ifPresent(this::runtimeFilteringMaxColumns);
+      String maxBytesRaw =
+          resolveConfig(
+              options,
+              CONFIG_RUNTIME_FILTERING_MAX_STATS_BYTES,
+              SPARK_CONF_RUNTIME_FILTERING_MAX_STATS_BYTES);
+      parseLongOrWarn(maxBytesRaw, CONFIG_RUNTIME_FILTERING_MAX_STATS_BYTES)
+          .ifPresent(this::runtimeFilteringMaxStatsBytes);
+      String parallelismRaw =
+          resolveConfig(
+              options,
+              CONFIG_RUNTIME_FILTERING_LOAD_PARALLELISM,
+              SPARK_CONF_RUNTIME_FILTERING_LOAD_PARALLELISM);
+      parseIntOrWarn(parallelismRaw, CONFIG_RUNTIME_FILTERING_LOAD_PARALLELISM)
+          .ifPresent(this::runtimeFilteringLoadParallelism);
+      String timeoutRaw =
+          resolveConfig(
+              options,
+              CONFIG_RUNTIME_FILTERING_LOAD_TIMEOUT_MS,
+              SPARK_CONF_RUNTIME_FILTERING_LOAD_TIMEOUT_MS);
+      parseLongOrWarn(timeoutRaw, CONFIG_RUNTIME_FILTERING_LOAD_TIMEOUT_MS)
+          .ifPresent(this::runtimeFilteringLoadTimeoutMs);
+      String maxInRaw =
+          resolveConfig(
+              options,
+              CONFIG_RUNTIME_FILTERING_MAX_IN_VALUES,
+              SPARK_CONF_RUNTIME_FILTERING_MAX_IN_VALUES);
+      parseIntOrWarn(maxInRaw, CONFIG_RUNTIME_FILTERING_MAX_IN_VALUES)
+          .ifPresent(this::runtimeFilteringMaxInValues);
       return this;
+    }
+
+    /**
+     * Parses a runtime-filtering numeric option, logging a WARN and returning {@link
+     * java.util.Optional#empty()} when the raw value is missing or unparseable. Callers use {@code
+     * ifPresent(setter)} so the builder's coded default survives a typo instead of the query
+     * failing with a {@link NumberFormatException} leaking the internal key name.
+     *
+     * <p>Only parse-level errors are forgiven. Range violations (e.g. {@code parallelism=0}, a
+     * negative {@code max.stats.bytes}) still throw {@link IllegalArgumentException} from the
+     * setter's {@code Preconditions.checkArgument} — that distinguishes "user typo'd a number"
+     * (silent fallback) from "user deliberately picked an invalid value" (loud failure so they
+     * notice it didn't take effect). The {@code rangeViolationStillFailsLoudly} test enforces this
+     * split behavior.
+     */
+    private static java.util.Optional<Integer> parseIntOrWarn(String raw, String configKey) {
+      if (raw == null) {
+        return java.util.Optional.empty();
+      }
+      try {
+        return java.util.Optional.of(Integer.parseInt(raw));
+      } catch (NumberFormatException e) {
+        LOG.warn("Invalid integer value '{}' for {}; using default", raw, configKey);
+        return java.util.Optional.empty();
+      }
+    }
+
+    private static java.util.Optional<Long> parseLongOrWarn(String raw, String configKey) {
+      if (raw == null) {
+        return java.util.Optional.empty();
+      }
+      try {
+        return java.util.Optional.of(Long.parseLong(raw));
+      } catch (NumberFormatException e) {
+        LOG.warn("Invalid long value '{}' for {}; using default", raw, configKey);
+        return java.util.Optional.empty();
+      }
+    }
+
+    /**
+     * Resolves a runtime-filtering config value with the two-level lookup documented in the DFP
+     * implementation plan: per-scan DataSourceV2 option (no {@code spark.} prefix) wins, SparkConf
+     * (with {@code spark.} prefix) is the fallback. Returns {@code null} if neither is set.
+     *
+     * <p>The SparkConf fallback uses {@code SparkSession.active()} and gracefully returns {@code
+     * null} if no session is active (e.g., in pure unit tests that construct options without Spark
+     * running).
+     */
+    private static String resolveConfig(
+        Map<String, String> options, String perScanKey, String sparkConfKey) {
+      if (options != null && options.containsKey(perScanKey)) {
+        return options.get(perScanKey);
+      }
+      try {
+        org.apache.spark.sql.SparkSession session = org.apache.spark.sql.SparkSession.active();
+        if (session == null) {
+          return null;
+        }
+        scala.Option<String> opt = session.conf().getOption(sparkConfKey);
+        return opt.isDefined() ? opt.get() : null;
+      } catch (Throwable t) {
+        // No active SparkSession (tests) or conf lookup failed - fall through to default.
+        return null;
+      }
     }
 
     /**

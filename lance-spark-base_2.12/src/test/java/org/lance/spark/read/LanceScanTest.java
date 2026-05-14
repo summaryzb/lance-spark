@@ -235,6 +235,48 @@ public class LanceScanTest {
   }
 
   @Test
+  public void testOutputPartitioningDegradesToUnknownWhenSplitsExceedDistinctValues() {
+    // Regression: if the dataset has multiple fragments sharing a partition value (6 fragments
+    // covering 2 distinct values), planInputPartitions() emits one InputPartition per fragment,
+    // so the emitted count exceeds the distinct-value count that KeyGroupedPartitioning would
+    // advertise. Previously threw IllegalStateException and crashed the query; now logs a WARN
+    // and falls back to UnknownPartitioning so the query can still run.
+    //
+    // TestTable1 only has 2 fragments so we can't reproduce the exact multi-fragment case with
+    // the real dataset, but we can force the mismatch by handing partitionInfo that advertises
+    // fewer distinct values than TestTable1's fragment count produces after planning.
+    Map<Integer, Comparable<?>> fragValues = new HashMap<>();
+    fragValues.put(0, "same");
+    fragValues.put(1, "same"); // both fragments share one value → derivedCount = 1
+    ZonemapFragmentPruner.PartitionInfo partInfo =
+        new ZonemapFragmentPruner.PartitionInfo("region", fragValues);
+
+    LanceScan scan =
+        new LanceScan(
+            TEST_SCHEMA,
+            TestUtils.TestTable1Config.readOptions,
+            org.lance.spark.utils.Optional.empty(),
+            org.lance.spark.utils.Optional.empty(),
+            org.lance.spark.utils.Optional.empty(),
+            org.lance.spark.utils.Optional.empty(),
+            org.lance.spark.utils.Optional.empty(),
+            new Filter[0],
+            null,
+            Collections.emptyMap(),
+            null,
+            partInfo,
+            Collections.emptyMap(),
+            null,
+            Collections.emptyMap());
+
+    scan.planInputPartitions(); // emits 2 splits (one per fragment)
+
+    // numPartitions=2, derivedCount=1 → mismatch, graceful fallback
+    Partitioning partitioning = scan.outputPartitioning();
+    assertInstanceOf(UnknownPartitioning.class, partitioning);
+  }
+
+  @Test
   public void testOutputPartitioningWithoutPartitionInfoIsUnknown() {
     // No partition info → should return UnknownPartitioning
     LanceScan scan = buildScan();

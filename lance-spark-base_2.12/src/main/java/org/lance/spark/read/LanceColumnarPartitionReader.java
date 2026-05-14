@@ -15,6 +15,7 @@ package org.lance.spark.read;
 
 import org.lance.spark.internal.LanceFragmentColumnarBatchScanner;
 
+import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 
@@ -26,9 +27,23 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
   private LanceFragmentColumnarBatchScanner fragmentReader;
   private ColumnarBatch currentBatch;
 
+  /**
+   * Count of fragments opened so far on this task. Reported to Spark via {@link
+   * #currentMetricsValues()} so the {@code fragmentsScanned} SQL metric aggregates correctly across
+   * all tasks of the scan. {@code volatile} because Spark is allowed to poll {@code
+   * currentMetricsValues()} from a thread other than the task thread — without it the poller could
+   * observe a stale 0 after the task thread has already incremented.
+   */
+  private volatile long fragmentsOpened;
+
   public LanceColumnarPartitionReader(LanceInputPartition inputPartition) {
     this.inputPartition = inputPartition;
     this.fragmentIndex = 0;
+  }
+
+  /** Package-private accessor for tests and for the {@link LanceRowPartitionReader} delegate. */
+  long getFragmentsOpened() {
+    return fragmentsOpened;
   }
 
   @Override
@@ -44,11 +59,29 @@ public class LanceColumnarPartitionReader implements PartitionReader<ColumnarBat
           LanceFragmentColumnarBatchScanner.create(
               inputPartition.getLanceSplit().getFragments().get(fragmentIndex), inputPartition);
       fragmentIndex++;
+      fragmentsOpened++;
       if (loadNextBatchFromCurrentReader()) {
         return true;
       }
     }
     return false;
+  }
+
+  @Override
+  public CustomTaskMetric[] currentMetricsValues() {
+    return new CustomTaskMetric[] {
+      new CustomTaskMetric() {
+        @Override
+        public String name() {
+          return FragmentsScannedMetric.NAME;
+        }
+
+        @Override
+        public long value() {
+          return fragmentsOpened;
+        }
+      }
+    };
   }
 
   private boolean loadNextBatchFromCurrentReader() throws IOException {

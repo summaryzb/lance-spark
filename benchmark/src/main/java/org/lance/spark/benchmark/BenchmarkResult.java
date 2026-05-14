@@ -15,6 +15,16 @@ package org.lance.spark.benchmark;
 
 public class BenchmarkResult {
 
+  /**
+   * DFP toggle state during this run. For Lance: {@code "on"} or {@code "off"}. For non-Lance
+   * scans the flag has no effect, so we record {@code "n/a"} to make cross-format joins on the
+   * CSV unambiguous.
+   */
+  public static final String DFP_ON = "on";
+
+  public static final String DFP_OFF = "off";
+  public static final String DFP_NA = "n/a";
+
   private final String queryName;
   private final String format;
   private final int iteration;
@@ -22,6 +32,7 @@ public class BenchmarkResult {
   private final boolean success;
   private final String errorMessage;
   private final QueryMetrics metrics;
+  private final String dfpMode;
 
   private BenchmarkResult(
       String queryName,
@@ -30,7 +41,8 @@ public class BenchmarkResult {
       long elapsedMs,
       boolean success,
       String errorMessage,
-      QueryMetrics metrics) {
+      QueryMetrics metrics,
+      String dfpMode) {
     this.queryName = queryName;
     this.format = format;
     this.iteration = iteration;
@@ -38,21 +50,47 @@ public class BenchmarkResult {
     this.success = success;
     this.errorMessage = errorMessage;
     this.metrics = metrics;
+    this.dfpMode = dfpMode == null ? DFP_NA : dfpMode;
   }
 
   public static BenchmarkResult success(
       String queryName, String format, int iteration, long elapsedMs) {
-    return new BenchmarkResult(queryName, format, iteration, elapsedMs, true, null, null);
+    return new BenchmarkResult(
+        queryName, format, iteration, elapsedMs, true, null, null, DFP_NA);
   }
 
   public static BenchmarkResult success(
       String queryName, String format, int iteration, long elapsedMs, QueryMetrics metrics) {
-    return new BenchmarkResult(queryName, format, iteration, elapsedMs, true, null, metrics);
+    return new BenchmarkResult(
+        queryName, format, iteration, elapsedMs, true, null, metrics, DFP_NA);
+  }
+
+  public static BenchmarkResult success(
+      String queryName,
+      String format,
+      int iteration,
+      long elapsedMs,
+      QueryMetrics metrics,
+      String dfpMode) {
+    return new BenchmarkResult(
+        queryName, format, iteration, elapsedMs, true, null, metrics, dfpMode);
   }
 
   public static BenchmarkResult failure(
       String queryName, String format, int iteration, long elapsedMs, String errorMessage) {
-    return new BenchmarkResult(queryName, format, iteration, elapsedMs, false, errorMessage, null);
+    return new BenchmarkResult(
+        queryName, format, iteration, elapsedMs, false, errorMessage, null, DFP_NA);
+  }
+
+  public static BenchmarkResult failure(
+      String queryName,
+      String format,
+      int iteration,
+      long elapsedMs,
+      String errorMessage,
+      String dfpMode) {
+    return new BenchmarkResult(
+        queryName, format, iteration, elapsedMs, false, errorMessage, null, dfpMode);
   }
 
   public String getQueryName() {
@@ -83,12 +121,17 @@ public class BenchmarkResult {
     return metrics;
   }
 
+  public String getDfpMode() {
+    return dfpMode;
+  }
+
   public String toCsvLine() {
     String base =
         String.join(
             ",",
             queryName,
             format,
+            dfpMode,
             String.valueOf(iteration),
             String.valueOf(elapsedMs),
             String.valueOf(success),
@@ -100,7 +143,7 @@ public class BenchmarkResult {
   }
 
   public static String csvHeader() {
-    return "query,format,iteration,elapsed_ms,success,error";
+    return "query,format,dfp_mode,iteration,elapsed_ms,success,error";
   }
 
   public static String csvHeaderWithMetrics() {

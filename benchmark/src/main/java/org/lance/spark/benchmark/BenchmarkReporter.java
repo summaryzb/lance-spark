@@ -183,6 +183,129 @@ public class BenchmarkReporter {
     }
 
     System.out.printf("Queries passed: %d, partial/failed: %d%n", passCount, failCount);
+
+    printDfpComparison();
+  }
+
+  /**
+   * Emit a separate DFP on-vs-off table when the input contains both {@code dfp_mode="on"} and
+   * {@code dfp_mode="off"} rows for the same query+format. Silent no-op otherwise so the regular
+   * Parquet-vs-Lance run (no DFP sweep) doesn't grow an irrelevant extra section.
+   */
+  private void printDfpComparison() {
+    // Collect per-query medians split by dfpMode, restricted to the lance format since only
+    // lance honors the flag. A row is comparable only when both "on" and "off" measurements
+    // exist.
+    Map<String, Long> medianOn = new LinkedHashMap<>();
+    Map<String, Long> medianOff = new LinkedHashMap<>();
+    Map<String, Long> fragmentsOn = new LinkedHashMap<>();
+    Map<String, Long> fragmentsOff = new LinkedHashMap<>();
+
+    Map<String, List<Long>> timesOn = new LinkedHashMap<>();
+    Map<String, List<Long>> timesOff = new LinkedHashMap<>();
+
+    for (BenchmarkResult r : results) {
+      if (!r.isSuccess() || !"lance".equals(r.getFormat())) {
+        continue;
+      }
+      Map<String, List<Long>> bucket = null;
+      if (BenchmarkResult.DFP_ON.equals(r.getDfpMode())) {
+        bucket = timesOn;
+      } else if (BenchmarkResult.DFP_OFF.equals(r.getDfpMode())) {
+        bucket = timesOff;
+      }
+      if (bucket != null) {
+        bucket.computeIfAbsent(r.getQueryName(), k -> new ArrayList<>()).add(r.getElapsedMs());
+        // Record the first observed fragmentsScanned per query+mode. The metric is plan-level
+        // and identical across iterations of the same query, so there's no need to median it.
+        QueryMetrics qm = r.getMetrics();
+        if (qm != null && qm.getLanceFragmentsScanned() >= 0) {
+          Map<String, Long> fragments =
+              BenchmarkResult.DFP_ON.equals(r.getDfpMode()) ? fragmentsOn : fragmentsOff;
+          fragments.putIfAbsent(r.getQueryName(), qm.getLanceFragmentsScanned());
+        }
+      }
+    }
+
+    for (Map.Entry<String, List<Long>> e : timesOn.entrySet()) {
+      List<Long> t = e.getValue();
+      t.sort(Long::compareTo);
+      medianOn.put(e.getKey(), t.get(t.size() / 2));
+    }
+    for (Map.Entry<String, List<Long>> e : timesOff.entrySet()) {
+      List<Long> t = e.getValue();
+      t.sort(Long::compareTo);
+      medianOff.put(e.getKey(), t.get(t.size() / 2));
+    }
+
+    // Only emit the section when we have paired on/off measurements on at least one query.
+    boolean hasPair = false;
+    for (String q : medianOn.keySet()) {
+      if (medianOff.containsKey(q)) {
+        hasPair = true;
+        break;
+      }
+    }
+    if (!hasPair) {
+      return;
+    }
+
+    System.out.println();
+    System.out.println("=== DFP On-vs-Off Comparison (Lance only) ===");
+    System.out.println();
+    System.out.printf(
+        "%-8s %10s %10s %8s %10s %10s %8s%n",
+        "Query", "OFF(ms)", "ON(ms)", "Speedup", "Frags OFF", "Frags ON", "Pruned%");
+    System.out.println("-".repeat(70));
+
+    List<Double> speedups = new ArrayList<>();
+    List<Double> prunePcts = new ArrayList<>();
+    int firedCount = 0;
+
+    for (String q : medianOn.keySet()) {
+      if (!medianOff.containsKey(q)) {
+        continue;
+      }
+      long on = medianOn.get(q);
+      long off = medianOff.get(q);
+      double speedup = off > 0 ? (double) off / on : 0.0;
+      speedups.add(speedup);
+
+      Long fOn = fragmentsOn.get(q);
+      Long fOff = fragmentsOff.get(q);
+      String fOnStr = fOn == null || fOn < 0 ? "-" : String.valueOf(fOn);
+      String fOffStr = fOff == null || fOff < 0 ? "-" : String.valueOf(fOff);
+      String prunedPctStr = "-";
+      if (fOn != null && fOff != null && fOff > 0 && fOn >= 0) {
+        double pct = 100.0 * (fOff - fOn) / fOff;
+        prunedPctStr = String.format("%.1f%%", pct);
+        prunePcts.add(pct);
+        if (fOn < fOff) {
+          firedCount++;
+        }
+      }
+
+      System.out.printf(
+          "%-8s %10d %10d %8.2fx %10s %10s %8s%n",
+          q, off, on, speedup, fOffStr, fOnStr, prunedPctStr);
+    }
+
+    System.out.println();
+    if (!speedups.isEmpty()) {
+      double logSum = 0;
+      for (double s : speedups) {
+        logSum += Math.log(s);
+      }
+      System.out.printf(
+          "Geometric mean speedup (OFF/ON): %.2fx across %d queries%n",
+          Math.exp(logSum / speedups.size()), speedups.size());
+    }
+    if (!prunePcts.isEmpty()) {
+      double avg = prunePcts.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
+      System.out.printf(
+          "DFP fired on %d / %d queries; mean fragment reduction: %.1f%%%n",
+          firedCount, prunePcts.size(), avg);
+    }
   }
 
   private QueryMetrics findMetricsForQuery(String queryName) {

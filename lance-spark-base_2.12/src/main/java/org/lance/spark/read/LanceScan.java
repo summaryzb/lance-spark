@@ -22,9 +22,12 @@ import org.apache.arrow.util.Preconditions;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.expressions.Expression;
 import org.apache.spark.sql.connector.expressions.FieldReference;
+import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.expressions.aggregate.AggregateFunc;
 import org.apache.spark.sql.connector.expressions.aggregate.Aggregation;
 import org.apache.spark.sql.connector.expressions.aggregate.CountStar;
+import org.apache.spark.sql.connector.expressions.filter.Predicate;
+import org.apache.spark.sql.connector.metric.CustomMetric;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReader;
@@ -33,6 +36,7 @@ import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.Statistics;
 import org.apache.spark.sql.connector.read.SupportsReportPartitioning;
 import org.apache.spark.sql.connector.read.SupportsReportStatistics;
+import org.apache.spark.sql.connector.read.SupportsRuntimeV2Filtering;
 import org.apache.spark.sql.connector.read.partitioning.KeyGroupedPartitioning;
 import org.apache.spark.sql.connector.read.partitioning.Partitioning;
 import org.apache.spark.sql.connector.read.partitioning.UnknownPartitioning;
@@ -47,12 +51,14 @@ import scala.collection.immutable.Map;
 import java.io.Serializable;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
 public class LanceScan
     implements Batch,
@@ -60,6 +66,7 @@ public class LanceScan
         SupportsMetadata,
         SupportsReportStatistics,
         SupportsReportPartitioning,
+        SupportsRuntimeV2Filtering,
         Serializable {
   private static final long serialVersionUID = 947284762748623947L;
   private static final Logger LOG = LoggerFactory.getLogger(LanceScan.class);
@@ -83,12 +90,137 @@ public class LanceScan
 
   /**
    * Pre-computed surviving fragment IDs from zonemap pruning in LanceScanBuilder. When non-null,
-   * {@link #pruneByZonemapStats} skips re-computing and uses these directly.
+   * {@link #pruneByZonemapStats} uses these directly instead of recomputing.
+   *
+   * <p>Not {@code final}: {@link #filter(Predicate[])} nulls this out on a successful
+   * runtime-narrowing so the pruner reads {@link #effectiveSurvivingFragmentIds} instead. {@code
+   * volatile} for the same reason the other mutable runtime-state fields are — gives a stable
+   * happens-before for the {@code filter() → planInputPartitions()} hand-off on the driver thread,
+   * so the null-out is guaranteed visible to subsequent reads even if speculative planning or
+   * post-deserialization access happens on a different thread.
    */
-  private final Set<Integer> cachedSurvivingFragmentIds;
+  private volatile Set<Integer> cachedSurvivingFragmentIds;
 
-  /** Number of partitions after pruning, set during {@link #planInputPartitions()}. */
-  private transient int numPartitions = -1;
+  /**
+   * Immutable snapshot of the static-pruning survivor count captured at scan construction. Used as
+   * the invariant baseline for {@link #fragmentsPrunedRuntime} — {@link
+   * #cachedSurvivingFragmentIds} cannot serve that role because {@code filter()} nulls it out on
+   * the first successful narrowing, making subsequent {@code filter()} calls lose the baseline.
+   * When no static pruning was done at build time, this equals the full fragment count (or -1 if
+   * the build-time manifest did not report a total; caller falls back to {@code fragmentsTotal}).
+   */
+  private final long staticSurvivorCountAtBuild;
+
+  /**
+   * Number of partitions after pruning, set during {@link #planInputPartitions()} and reset in
+   * {@link #filter(Predicate[])}. Marked {@code volatile} to give a stable happens-before for the
+   * {@code filter() → outputPartitioning() → planInputPartitions()} hand-off on the driver thread;
+   * without it, {@code outputPartitioning()} could read a stale value and the Phase 3 assertion
+   * could spuriously trip.
+   */
+  private transient volatile int numPartitions = -1;
+
+  /**
+   * Runtime filters most recently received via {@link #filter(Predicate[])}, after conversion to V1
+   * and column-level filtering. Participates in {@link #equals(Object)} / {@link #hashCode()} so
+   * that scans with distinct runtime filters do not wrongly dedupe under {@code ReusedExchange}.
+   *
+   * <p>{@code transient} because runtime filters are driver-only state; executors consume the
+   * already-pruned {@link LanceInputPartition} payloads. {@code volatile} documents the intended
+   * happens-before for the sequential {@code filter()} → {@code planInputPartitions()} hand-off on
+   * the driver thread.
+   */
+  private transient volatile Filter[] runtimeFilters;
+
+  /**
+   * Surviving fragment IDs after applying runtime filters, populated by {@link
+   * #filter(Predicate[])}. When non-null, {@link #pruneByZonemapStats} prefers this over {@link
+   * #cachedSurvivingFragmentIds}. When null, no runtime narrowing has happened on this scan.
+   */
+  private transient volatile Set<Integer> effectiveSurvivingFragmentIds;
+
+  // ---------------------------------------------------------------------------------------------
+  // Observability metrics (Phase 2.5). Instance-local counters exposed via package-private
+  // getters for tests and log emission. Names are a stability contract: breaking changes require
+  // a major version bump. Full Spark SQL UI integration via the DataSourceV2 CustomMetric API is
+  // a deferred follow-up; these fields provide the observable behavior today via INFO logs and
+  // test assertions. `transient` because metrics are driver-only state.
+  // ---------------------------------------------------------------------------------------------
+  // Counters that accumulate (received-count, predicates-dropped, errors) use AtomicLong so the
+  // `++` increment operator remains correct even if a future Spark execution model invokes
+  // filter() concurrently. The pure-assignment counters (fragmentsTotal,
+  // fragmentsPrunedStatic, fragmentsPrunedRuntime) are `volatile long` — assignment is already
+  // atomic for longs when `volatile`, and there is no read-modify-write pattern on them.
+  // `transient` because these are driver-only state and are not serialized to executors.
+  /** Fragments in the dataset at plan time (set by {@link #planInputPartitions()}). */
+  private transient volatile long fragmentsTotal;
+
+  /**
+   * Fragments eliminated by static filters + limit pruning (set by {@link #planInputPartitions()}).
+   */
+  private transient volatile long fragmentsPrunedStatic;
+
+  /** Fragments eliminated by {@link #filter(Predicate[])} runtime filters. */
+  private transient volatile long fragmentsPrunedRuntime;
+
+  /** Count of calls to {@link #filter(Predicate[])} for this scan. */
+  private transient java.util.concurrent.atomic.AtomicLong runtimeFiltersReceived =
+      new java.util.concurrent.atomic.AtomicLong();
+
+  /** Count of V2 predicates the converter could not translate. */
+  private transient java.util.concurrent.atomic.AtomicLong predicatesDropped =
+      new java.util.concurrent.atomic.AtomicLong();
+
+  /** Exceptions caught inside {@link #filter(Predicate[])} (graceful fallback). */
+  private transient java.util.concurrent.atomic.AtomicLong runtimeFilterErrors =
+      new java.util.concurrent.atomic.AtomicLong();
+
+  /**
+   * Rehydrates transient metric counters after Java deserialization. The default deserializer
+   * initializes transient fields to {@code null}, which would NPE on the first {@code
+   * .incrementAndGet()}. Executors never call these counters, but defensively reinitialize so any
+   * code path reading them post-deserialization sees a zero-valued counter instead of NPE.
+   */
+  private void readObject(java.io.ObjectInputStream in)
+      throws java.io.IOException, ClassNotFoundException {
+    in.defaultReadObject();
+    this.runtimeFiltersReceived = new java.util.concurrent.atomic.AtomicLong();
+    this.predicatesDropped = new java.util.concurrent.atomic.AtomicLong();
+    this.runtimeFilterErrors = new java.util.concurrent.atomic.AtomicLong();
+  }
+
+  /**
+   * Seeds the driver-side metrics populated in {@link LanceScanBuilder#build()} — currently only
+   * the fragment total is known at construction time. Other counters start at zero and are updated
+   * in {@link #filter(Predicate[])} and {@link #planInputPartitions()}.
+   */
+  void seedMetricsFromBuilder(long totalFragmentsAtBuild) {
+    this.fragmentsTotal = totalFragmentsAtBuild;
+  }
+
+  long getFragmentsTotalMetric() {
+    return fragmentsTotal;
+  }
+
+  long getFragmentsPrunedStaticMetric() {
+    return fragmentsPrunedStatic;
+  }
+
+  long getFragmentsPrunedRuntimeMetric() {
+    return fragmentsPrunedRuntime;
+  }
+
+  long getRuntimeFiltersReceivedMetric() {
+    return runtimeFiltersReceived.get();
+  }
+
+  long getPredicatesDroppedMetric() {
+    return predicatesDropped.get();
+  }
+
+  long getRuntimeFilterErrorsMetric() {
+    return runtimeFilterErrors.get();
+  }
 
   /**
    * Partition info detected from zonemap stats. When present, enables storage-partitioned joins
@@ -136,6 +268,11 @@ public class LanceScan
     this.statistics = statistics;
     this.zonemapStats = zonemapStats != null ? zonemapStats : Collections.emptyMap();
     this.cachedSurvivingFragmentIds = survivingFragmentIds;
+    // Capture the static-pruning survivor count at construction so fragmentsPrunedRuntime can
+    // use it as an immutable baseline across multiple filter() calls. -1 means "unknown — use
+    // fragmentsTotal as a fallback baseline at filter() time".
+    this.staticSurvivorCountAtBuild =
+        survivingFragmentIds != null ? survivingFragmentIds.size() : -1L;
     this.partitionInfo = partitionInfo;
     this.initialStorageOptions = initialStorageOptions;
     this.namespaceImpl = namespaceImpl;
@@ -150,6 +287,10 @@ public class LanceScan
   @Override
   public InputPartition[] planInputPartitions() {
     LanceSplit.ScanPlanResult planResult = LanceSplit.planScan(readOptions);
+    int totalSplits = planResult.getSplits().size();
+    // Refresh fragmentsTotal in case the dataset/version changed between build() and plan time.
+    this.fragmentsTotal = totalSplits;
+
     List<LanceSplit> prunedSplits = pruneByRowAddrFilters(planResult.getSplits());
 
     // Zonemap-based fragment pruning: uses per-column min/max/null_count
@@ -162,6 +303,13 @@ public class LanceScan
     // This avoids scheduling hundreds of unnecessary tasks. Correctness is guaranteed
     // because Spark still keeps a global CollectLimit on top (isPartiallyPushed = true).
     prunedSplits = pruneByLimit(prunedSplits, planResult.getFragmentRowCounts());
+
+    // fragmentsPrunedRuntime is computed in filter() (which runs before planInputPartitions
+    // on the driver). fragmentsPrunedStatic is the remaining reduction: total minus both the
+    // runtime-survivors and whatever additional pruning the limit/rowaddr paths removed.
+    int survived = prunedSplits.size();
+    long totalEliminated = Math.max(0L, (long) totalSplits - survived);
+    this.fragmentsPrunedStatic = Math.max(0L, totalEliminated - fragmentsPrunedRuntime);
 
     // Capture as effectively final for use in lambda
     final List<LanceSplit> finalSplits = prunedSplits;
@@ -279,10 +427,16 @@ public class LanceScan
       List<LanceSplit> allSplits, java.util.Map<Integer, Long> fragmentRowCounts) {
     if (!limit.isPresent()
         || whereConditions.isPresent()
+        || runtimeFilters != null
         || topNSortOrders.isPresent()
         || pushedAggregation.isPresent()
         || readOptions.getNearest() != null
         || fragmentRowCounts.isEmpty()) {
+      // whereConditions covers Spark-pushed static filters; runtimeFilters covers DFP runtime
+      // filters. Both mean the per-fragment manifest row count over-estimates what the executor
+      // will actually emit, so stopping early based on manifest counts can drop fragments that
+      // contain the only rows satisfying the filter — returning fewer rows than LIMIT requested
+      // despite more matches existing in skipped fragments.
       return allSplits;
     }
 
@@ -324,9 +478,14 @@ public class LanceScan
    * predicate are skipped entirely, avoiding fragment opens, scan setup, and task scheduling.
    */
   private List<LanceSplit> pruneByZonemapStats(List<LanceSplit> allSplits) {
-    // Use cached result from LanceScanBuilder if available, otherwise compute.
+    // Preference order:
+    //   1. effectiveSurvivingFragmentIds populated by filter() — reflects runtime narrowing.
+    //   2. cachedSurvivingFragmentIds pre-computed by LanceScanBuilder — static pruning only.
+    //   3. Recompute from pushedFilters + zonemapStats (fallback when neither cache is present).
     Set<Integer> allowedIds;
-    if (cachedSurvivingFragmentIds != null) {
+    if (effectiveSurvivingFragmentIds != null) {
+      allowedIds = effectiveSurvivingFragmentIds;
+    } else if (cachedSurvivingFragmentIds != null) {
       allowedIds = cachedSurvivingFragmentIds;
     } else if (!zonemapStats.isEmpty()) {
       allowedIds = ZonemapFragmentPruner.pruneFragments(pushedFilters, zonemapStats).orElse(null);
@@ -367,16 +526,344 @@ public class LanceScan
   @Override
   public Partitioning outputPartitioning() {
     if (partitionInfo != null) {
-      // Use partition info fragment count — available before
-      // planInputPartitions() is called. This allows
-      // V2ScanPartitioningAndOrdering to see the partitioning
-      // early enough for SPJ.
-      int partCount =
-          numPartitions >= 0 ? numPartitions : partitionInfo.getFragmentPartitionValues().size();
+      // Number of distinct partition values currently advertised. Post-filter, only surviving
+      // fragments contribute; pre-filter, all fragments in partitionInfo do. This preserves the
+      // SPJ contract: never introduce new partition values, never exceed the per-key partition
+      // count.
+      int derivedCount = derivedPartitionCount();
+
+      // Spark's SPJ contract (BatchScanExec.scala:78-117) requires KeyGroupedPartitioning's
+      // numPartitions to match the emitted InputPartition count. When the dataset has multiple
+      // fragments sharing the same partition value (e.g., 6 fragments covering 2 distinct values),
+      // planInputPartitions() emits one split per fragment, so the emitted count can exceed the
+      // distinct-value count. In that case SPJ cannot be represented with the current splitting
+      // strategy — degrade to UnknownPartitioning instead of crashing the query. The kill-switch
+      // is still available for users who need SPJ and can tolerate the fallback scan shape.
+      if (numPartitions > derivedCount) {
+        LOG.warn(
+            "SPJ disabled for scan={}: emitted {} splits exceed {} distinct partition values."
+                + " Set {}=false to also disable DFP if needed.",
+            description(),
+            numPartitions,
+            derivedCount,
+            LanceSparkReadOptions.CONFIG_RUNTIME_FILTERING_ENABLED);
+        return new UnknownPartitioning(numPartitions);
+      }
       Expression[] keys = new Expression[] {FieldReference.apply(partitionInfo.getColumnName())};
-      return new KeyGroupedPartitioning(keys, partCount);
+      return new KeyGroupedPartitioning(keys, derivedCount);
     }
     return new UnknownPartitioning(numPartitions >= 0 ? numPartitions : 0);
+  }
+
+  /**
+   * The number of distinct partition values advertised by {@link #outputPartitioning()}. Uses
+   * {@link #effectiveSurvivingFragmentIds} when populated (DFP post-filter), otherwise the
+   * pre-filter partitionInfo map.
+   */
+  private int derivedPartitionCount() {
+    java.util.Map<Integer, Comparable<?>> allPartValues =
+        partitionInfo.getFragmentPartitionValues();
+    // Snapshot the volatile field once to avoid a torn-read NPE if a concurrent filter() call
+    // nulls it between the null check and the iteration. In the normal single-threaded driver
+    // path this is equivalent; the local binding only matters under hypothetical re-entrant use.
+    Set<Integer> survivors = this.effectiveSurvivingFragmentIds;
+    if (survivors == null) {
+      // Distinct partition values across all fragments. Previously returned the map's size (the
+      // fragment count), which was wrong for datasets where multiple fragments share the same
+      // partition value — it over-advertised KeyGroupedPartitioning.numPartitions and then the
+      // subsequent planInputPartitions() count check fired a spurious violation.
+      return new HashSet<>(allPartValues.values()).size();
+    }
+    Set<Comparable<?>> surviving = new HashSet<>();
+    Set<Integer> missing = null;
+    for (Integer fragId : survivors) {
+      Comparable<?> v = allPartValues.get(fragId);
+      if (v == null) {
+        // filter()'s Phase 3 subset check already rejects this case; reaching here means that
+        // guard was bypassed (e.g., a test set effectiveSurvivingFragmentIds directly, or a
+        // future refactor removed it). Fail loudly rather than silently under-count and advertise
+        // an invalid KeyGroupedPartitioning to Spark.
+        if (missing == null) {
+          missing = new HashSet<>();
+        }
+        missing.add(fragId);
+      } else {
+        surviving.add(v);
+      }
+    }
+    if (missing != null) {
+      throw new IllegalStateException(
+          "LanceScan.outputPartitioning(): surviving fragments "
+              + missing
+              + " have no entry in the build-time partition-value map for scan="
+              + description()
+              + ". This violates the SPJ contract. Set "
+              + LanceSparkReadOptions.CONFIG_RUNTIME_FILTERING_ENABLED
+              + "=false to disable DFP while this is investigated.");
+    }
+    return surviving.size();
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Dynamic File Pruning (DFP) — SupportsRuntimeV2Filtering implementation (Phase 2).
+  // See dfp-implementation-plan.md for the full design; the step numbers below mirror the plan.
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * Columns we can accept runtime filters on. These are exactly the columns for which zonemap stats
+   * were loaded on the driver during {@link LanceScanBuilder#build()}; loading for columns outside
+   * this set is intentionally impossible after {@code build()} has closed the dataset.
+   */
+  @Override
+  public NamedReference[] filterAttributes() {
+    if (!readOptions.isRuntimeFilteringEnabled() || zonemapStats.isEmpty()) {
+      return new NamedReference[0];
+    }
+    // Intersect zonemap-indexed columns with the current scan's projected schema. Advertising a
+    // column that was pruned away by SupportsPushDownRequiredColumns makes Spark's attribute
+    // resolver throw "Unable to resolve X given [projected cols]" during runtime-filter planning,
+    // because Spark builds an AttributeReference from the NamedReference and expects the scan to
+    // actually output that column. This is particularly easy to hit on star-schema queries that
+    // join on ss_sold_date_sk and ss_item_sk but don't read ss_customer_sk: the fact-side scan
+    // doesn't include it in the output, so Spark can't construct a runtime filter on it.
+    Set<String> projected = new HashSet<>();
+    for (org.apache.spark.sql.types.StructField f : schema.fields()) {
+      projected.add(f.name());
+    }
+    return zonemapStats.keySet().stream()
+        .filter(projected::contains)
+        .map(FieldReference::apply)
+        .toArray(NamedReference[]::new);
+  }
+
+  /**
+   * Receives runtime filters derived by Spark's {@code PartitionPruning} rule from a small build
+   * side of a join. The method mutates the scan in place — Spark re-reads {@link
+   * #planInputPartitions()} on the same reference via {@code BatchScanExec.scala:76}.
+   *
+   * <p>Step order (see plan):
+   *
+   * <ol>
+   *   <li>Clear all prior runtime state unconditionally (<code>runtimeFilters</code>, <code>
+   *       effectiveSurvivingFragmentIds</code>, <code>numPartitions</code>). Replace-not-union
+   *       semantics: each call starts from the static baseline.
+   *   <li>Convert {@code predicates} to V1 filters via {@link PredicateToFilterConverter}, dropping
+   *       entries that reference columns not in {@link #zonemapStats}. If the converted array is
+   *       empty (no-op call), leave {@code runtimeFilters} null.
+   *   <li>Otherwise assign the converted array to {@link #runtimeFilters} so {@code equals/
+   *       hashCode} reflect the new predicates.
+   *   <li>Merge with {@link #pushedFilters} (logical AND), re-run {@link
+   *       ZonemapFragmentPruner#pruneFragments}.
+   *   <li>If the pruner returns a narrowed set, store it in {@link #effectiveSurvivingFragmentIds}
+   *       and null out {@link #cachedSurvivingFragmentIds}. Otherwise leave {@code
+   *       cachedSurvivingFragmentIds} intact.
+   * </ol>
+   *
+   * <p>Error handling: generic exceptions fall back to static pruning with a WARN. An {@code
+   * IllegalStateException} — thrown by the Phase 3 SPJ subset check — is rethrown so correctness
+   * violations are fail-fast rather than silently masked.
+   */
+  @Override
+  public void filter(Predicate[] predicates) {
+    // Step 1 — unconditional reset of runtime state.
+    this.effectiveSurvivingFragmentIds = null;
+    this.numPartitions = -1;
+    this.runtimeFilters = null;
+    this.fragmentsPrunedRuntime = 0L;
+    this.runtimeFiltersReceived.incrementAndGet();
+
+    if (!readOptions.isRuntimeFilteringEnabled()) {
+      return;
+    }
+    if (predicates == null || predicates.length == 0) {
+      return;
+    }
+
+    try {
+      int maxInValues = readOptions.getRuntimeFilteringMaxInValues();
+      int predicatesIn = predicates.length;
+      Filter[] converted =
+          PredicateToFilterConverter.convertAll(
+              predicates, zonemapStats.keySet(), maxInValues, LOG);
+      // Every input predicate that did not survive conversion is counted as dropped.
+      this.predicatesDropped.addAndGet(Math.max(0, predicatesIn - converted.length));
+
+      if (converted.length == 0) {
+        // Step 2 — empty conversion. Two distinct cases with DIFFERENT pruneByLimit semantics:
+        //   (a) predicatesIn == 0 : caller passed no predicates. Spark did not inject a runtime
+        //       filter. No Filter operator sits above the scan; manifest row counts are accurate
+        //       and pruneByLimit is safe to run.
+        //   (b) predicatesIn >  0 : caller passed predicates but every one was dropped (cap
+        //       exceeded, unsupported shape, wrong column). Spark STILL has a Filter operator
+        //       above BatchScanExec — runtime-filter row-level filtering happens at execution
+        //       regardless of what the scan did. Manifest row counts over-estimate post-Filter
+        //       emission, so pruneByLimit MUST stay suppressed, otherwise it drops fragments
+        //       containing the only matching rows and LIMIT returns fewer rows than requested.
+        //
+        // Install an empty-array sentinel for case (b). pruneByLimit's runtimeFilters != null
+        // guard fires. equals/hashCode treat null and Filter[0] as equivalent (both mean "no
+        // narrowing filter to compare against"), so ReusedExchange dedup is preserved across
+        // scans that received no-op vs. cap-dropped filters.
+        if (predicatesIn > 0) {
+          this.runtimeFilters = new Filter[0];
+        }
+        LOG.info(
+            "DFP filter() no-op for scan={}: {} predicates in, 0 converted;"
+                + " runtimeFiltersReceived={} predicatesDropped={}",
+            description(),
+            predicatesIn,
+            runtimeFiltersReceived.get(),
+            predicatesDropped.get());
+        return;
+      }
+
+      // Step 3 — record the converted filters for scan identity.
+      this.runtimeFilters = converted;
+
+      // Step 4 — merge with the static baseline (not with any prior runtimeFilters) and re-prune.
+      Filter[] combined =
+          Stream.concat(Arrays.stream(pushedFilters), Arrays.stream(converted))
+              .toArray(Filter[]::new);
+      Set<Integer> newSurviving =
+          ZonemapFragmentPruner.pruneFragments(combined, zonemapStats).orElse(null);
+      if (newSurviving == null) {
+        // Pruner could not narrow (e.g., value overlaps every zone, or filter on unindexed
+        // column). Keep cachedSurvivingFragmentIds intact so static pruning still applies. Leave
+        // runtimeFilters = converted: Spark wraps BatchScanExec in a Filter operator for the
+        // runtime-filter predicate, so row-level filtering still happens at execution even
+        // though the scan emitted every fragment. pruneByLimit MUST stay suppressed because
+        // manifest row counts over-estimate post-Filter emission by the same mechanism as when
+        // the pruner does narrow. Two scans with the same runtime filter here still equals()
+        // each other via equivalentRuntimeFilters, so ReusedExchange dedup continues to work;
+        // clearing runtimeFilters would incorrectly equate them with a never-filtered scan.
+        LOG.info(
+            "DFP filter() for scan={}: {} predicates in, {} converted, no narrowing derived",
+            description(),
+            predicatesIn,
+            converted.length);
+        return;
+      }
+
+      // Phase 3 — SPJ contract defensive subset check. When partitionInfo is present, the scan
+      // advertises KeyGroupedPartitioning with a fixed set of partition values. After runtime
+      // filtering, the surviving fragments' partition-value set MUST be a subset of the
+      // originally reported set (BatchScanExec.scala:78-117 enforces this at the Spark side).
+      // The ZonemapFragmentPruner can only shrink the surviving set, so a violation here
+      // indicates an upstream pruner bug; fail-fast rather than silently masking incorrect
+      // results downstream.
+      if (partitionInfo != null) {
+        java.util.Map<Integer, Comparable<?>> allPartValues =
+            partitionInfo.getFragmentPartitionValues();
+        Set<Comparable<?>> originalValues = new HashSet<>(allPartValues.values());
+        Set<Comparable<?>> survivingValues = new HashSet<>();
+        Set<Integer> missingFragIds = new HashSet<>();
+        for (Integer fragId : newSurviving) {
+          Comparable<?> v = allPartValues.get(fragId);
+          if (v == null) {
+            missingFragIds.add(fragId);
+          } else {
+            survivingValues.add(v);
+          }
+        }
+        if (!missingFragIds.isEmpty()) {
+          // Surviving fragments aren't in the partition-column zonemap. This can legitimately
+          // happen when different columns' indexes cover different fragment sets (e.g., a new
+          // fragment was appended after the partition column's index was built, but the DFP
+          // column's index was rebuilt and covers it). We can't represent the narrowed survivor
+          // set without partition values, so fall back to pre-DFP static pruning for this scan.
+          // CRITICAL: leave runtimeFilters = converted intact. Spark keeps the runtime filter in
+          // a Filter operator above BatchScanExec regardless of what the scan does with it, so
+          // post-scan rows are still filtered at execution. pruneByLimit's runtimeFilters != null
+          // guard (R30) must stay armed, otherwise manifest-row-count-based limit pruning would
+          // drop fragments that contain the only matching rows — returning fewer rows than LIMIT.
+          LOG.warn(
+              "DFP SPJ: surviving fragments {} absent from partition-value map for scan={};"
+                  + " dropping runtime narrowing, static pruning preserved.",
+              missingFragIds,
+              description());
+          this.runtimeFilterErrors.incrementAndGet();
+          this.effectiveSurvivingFragmentIds = null;
+          return;
+        }
+        if (!originalValues.containsAll(survivingValues)) {
+          // Surviving partition values weren't in the originally reported set. Same graceful
+          // fallback as above — signals an upstream pruner bug but crashing the query doesn't
+          // help the user, and static pruning is still correct. Same critical rule: keep
+          // runtimeFilters set so pruneByLimit stays suppressed for this scan.
+          Set<Comparable<?>> extras = new HashSet<>(survivingValues);
+          extras.removeAll(originalValues);
+          LOG.warn(
+              "DFP SPJ: surviving partition values {} not in originally reported set {} for"
+                  + " scan={}; dropping runtime narrowing, static pruning preserved.",
+              extras,
+              originalValues,
+              description());
+          this.runtimeFilterErrors.incrementAndGet();
+          this.effectiveSurvivingFragmentIds = null;
+          return;
+        }
+      }
+
+      // Step 5 — install the narrowed set; invalidate the build-time cache so pruneByZonemapStats
+      // consults effectiveSurvivingFragmentIds on the subsequent planInputPartitions() call.
+      // Compute the runtime-pruned count BEFORE nulling cachedSurvivingFragmentIds. Use the
+      // IMMUTABLE staticSurvivorCountAtBuild as the baseline — not cachedSurvivingFragmentIds,
+      // because a prior filter() call may have nulled that out; not fragmentsPrunedStatic,
+      // because it is populated in planInputPartitions() which runs AFTER filter(). When
+      // staticSurvivorCountAtBuild is -1 (no build-time static pruning), fall back to
+      // fragmentsTotal which is seeded by seedMetricsFromBuilder() and refreshed in
+      // planInputPartitions().
+      long preRuntimeSurvivors =
+          staticSurvivorCountAtBuild >= 0 ? staticSurvivorCountAtBuild : fragmentsTotal;
+      if (preRuntimeSurvivors > 0 && newSurviving.size() <= preRuntimeSurvivors) {
+        this.fragmentsPrunedRuntime = preRuntimeSurvivors - newSurviving.size();
+      }
+      this.effectiveSurvivingFragmentIds = newSurviving;
+      this.cachedSurvivingFragmentIds = null;
+      LOG.info(
+          "DFP filter() narrowed scan={}: {} -> {} fragments ({} pruned) via {} predicates",
+          description(),
+          preRuntimeSurvivors,
+          newSurviving.size(),
+          fragmentsPrunedRuntime,
+          converted.length);
+    } catch (IllegalStateException ise) {
+      // Preserved as a defensive rethrow for any genuine correctness-critical programming error
+      // that surfaces as IllegalStateException. Phase 3's SPJ subset check now degrades softly
+      // (WARN + disable runtime filter) rather than throwing, so this branch is currently dead
+      // for that path — but any other caller in the try block that signals IllegalStateException
+      // semantically indicates a bug that should not be silently swallowed.
+      throw ise;
+    } catch (Throwable t) {
+      this.runtimeFilterErrors.incrementAndGet();
+      LOG.warn(
+          "Runtime filter failed for scan={}, falling back to static pruning."
+              + " Predicates={} runtimeFilterErrors={} Error={}",
+          description(),
+          Arrays.toString(predicates),
+          runtimeFilterErrors.get(),
+          t.getMessage());
+      // Ensure any partial state is cleared.
+      this.effectiveSurvivingFragmentIds = null;
+      // Mirror the R50 sentinel: if Spark handed us real predicates then it placed a Filter
+      // operator above BatchScanExec, which will apply the predicate at row level regardless of
+      // whether we successfully pruned. pruneByLimit's runtimeFilters != null guard must stay
+      // armed so manifest row counts don't drive early split termination and silently drop
+      // fragments containing the only matching rows. An empty-array sentinel preserves the
+      // guard without affecting equals/hashCode (equivalentRuntimeFilters treats null and
+      // Filter[0] as equivalent).
+      if (predicates != null && predicates.length > 0) {
+        this.runtimeFilters = new Filter[0];
+      } else {
+        this.runtimeFilters = null;
+      }
+    }
+  }
+
+  /** Short human-readable description used in log/exception messages. */
+  @Override
+  public String description() {
+    return "LanceScan(" + readOptions.getDatasetName() + ")";
   }
 
   @Override
@@ -411,6 +898,21 @@ public class LanceScan
   }
 
   /**
+   * Declares the executor-side DFP metrics that partition readers may emit via {@link
+   * org.apache.spark.sql.connector.read.PartitionReader#currentMetricsValues()}. Today this is a
+   * single counter — {@link FragmentsScannedMetric} — which reports how many Lance fragments each
+   * task actually opened. Spark aggregates across tasks and surfaces the total in the SQL UI.
+   *
+   * <p>The eight driver-side counters ({@code fragmentsTotal}, {@code fragmentsPrunedStatic}, etc.)
+   * are not declared here — they are computed on the driver and emitted via INFO logs, not through
+   * the task-metric pipeline.
+   */
+  @Override
+  public CustomMetric[] supportedCustomMetrics() {
+    return new CustomMetric[] {new FragmentsScannedMetric()};
+  }
+
+  /**
    * Required for Spark's ReusedExchange: {@code BatchScanExec.equals()} compares {@code batch}
    * objects, which delegate to this method since LanceScan implements Batch.
    *
@@ -432,7 +934,8 @@ public class LanceScan
         && Objects.equals(offset, that.offset)
         && Objects.equals(topNSortOrders.toString(), that.topNSortOrders.toString())
         && aggregationEquals(pushedAggregation, that.pushedAggregation)
-        && equivalentFilters(pushedFilters, that.pushedFilters);
+        && equivalentFilters(pushedFilters, that.pushedFilters)
+        && equivalentRuntimeFilters(runtimeFilters, that.runtimeFilters);
   }
 
   @Override
@@ -442,7 +945,31 @@ public class LanceScan
             schema, readOptions, whereConditions, limit, offset, topNSortOrders.toString());
     result = 31 * result + Arrays.hashCode(sortedByHash(pushedFilters));
     result = 31 * result + aggregationHashCode(pushedAggregation);
+    // Runtime filters participate in scan identity so ReusedExchange does not collide two
+    // logically distinct DFP-narrowed scans. Null is treated identically to Filter[0] so a scan
+    // that never had filter() called hashes identically to a scan that received a no-op call.
+    Filter[] rf = runtimeFilters;
+    if (rf != null && rf.length > 0) {
+      result = 31 * result + Arrays.hashCode(sortedByHash(rf));
+    }
     return result;
+  }
+
+  /**
+   * Null-and-empty-array tolerant equivalence check for runtime filters: a scan that never had
+   * {@link #filter(Predicate[])} called ({@code null}) compares equal to one that received a no-op
+   * {@code filter(new Predicate[0])} ({@code empty}). Both represent "no runtime filter".
+   */
+  private static boolean equivalentRuntimeFilters(Filter[] a, Filter[] b) {
+    int lenA = a == null ? 0 : a.length;
+    int lenB = b == null ? 0 : b.length;
+    if (lenA == 0 && lenB == 0) {
+      return true;
+    }
+    if (lenA != lenB) {
+      return false;
+    }
+    return equivalentFilters(a, b);
   }
 
   /**

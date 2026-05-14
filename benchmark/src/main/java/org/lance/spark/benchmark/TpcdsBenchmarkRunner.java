@@ -36,6 +36,14 @@ public class TpcdsBenchmarkRunner {
     boolean explain = false;
     boolean metrics = false;
     String queries = null;
+    // Per-query wall-clock cap. 0 = no timeout. 15-minute default matches the recommendation in
+    // benchmark/DFP-WORKFLOW.md — long enough for the heaviest sf=100 queries (q72/q14b) under
+    // good plans, short enough that a pathological plan doesn't block the whole sweep.
+    long queryTimeoutSeconds = 900L;
+    // "default" means do NOT touch spark.lance.runtime.filtering.enabled — Lance's own default
+    // (on) applies. "on" / "off" pin the flag. "both" runs each lance query twice, once with
+    // DFP on and once with DFP off, so the output CSV can be pivoted into an A/B comparison.
+    String dfpMode = "default";
 
     for (int i = 0; i < args.length; i++) {
       switch (args[i]) {
@@ -60,6 +68,24 @@ public class TpcdsBenchmarkRunner {
         case "--queries":
           queries = args[++i];
           break;
+        case "--query-timeout-seconds":
+          queryTimeoutSeconds = Long.parseLong(args[++i]);
+          if (queryTimeoutSeconds < 0L) {
+            System.err.println("--query-timeout-seconds must be >= 0 (0 disables the timeout)");
+            System.exit(1);
+          }
+          break;
+        case "--dfp-mode":
+          dfpMode = args[++i];
+          if (!dfpMode.equals("on")
+              && !dfpMode.equals("off")
+              && !dfpMode.equals("both")
+              && !dfpMode.equals("default")) {
+            System.err.println(
+                "Invalid --dfp-mode '" + dfpMode + "'. Expected on|off|both|default.");
+            System.exit(1);
+          }
+          break;
         default:
           System.err.println("Unknown argument: " + args[i]);
           printUsage();
@@ -74,6 +100,17 @@ public class TpcdsBenchmarkRunner {
     }
 
     String[] formats = formatsStr.split(",");
+    // Build the list of DFP modes to sweep. For non-lance formats the mode has no effect on the
+    // plan, but we still iterate so the A/B output retains a complete format × query × mode
+    // matrix (the non-lance rows will have identical numbers, which is the point of the control).
+    String[] dfpModesToRun =
+        dfpMode.equals("both")
+            ? new String[] {BenchmarkResult.DFP_ON, BenchmarkResult.DFP_OFF}
+            : dfpMode.equals("on")
+                ? new String[] {BenchmarkResult.DFP_ON}
+                : dfpMode.equals("off")
+                    ? new String[] {BenchmarkResult.DFP_OFF}
+                    : new String[] {BenchmarkResult.DFP_NA};
 
     SparkSession spark =
         SparkSession.builder().appName("TPC-DS Benchmark").getOrCreate();
@@ -88,23 +125,35 @@ public class TpcdsBenchmarkRunner {
 
       TpcdsDataLoader loader = new TpcdsDataLoader(spark, dataDir);
       TpcdsQueryRunner runner =
-          new TpcdsQueryRunner(spark, iterations, explain, metricsListener, queries);
+          new TpcdsQueryRunner(
+              spark, iterations, explain, metricsListener, queries, queryTimeoutSeconds * 1000L);
       List<BenchmarkResult> allResults = new ArrayList<>();
 
       for (String format : formats) {
         format = format.trim();
-        System.out.println();
-        System.out.println("=== Format: " + format + " ===");
-        System.out.flush();
-
-        // Register pre-generated tables as temp views
+        // Register pre-generated tables as temp views once per format; the DFP sweep reuses them.
         loader.registerTables(format);
 
-        // Run queries
-        List<BenchmarkResult> formatResults = runner.runAllQueries(format);
-        allResults.addAll(formatResults);
+        for (String mode : dfpModesToRun) {
+          // For non-lance formats, DFP is always N/A regardless of the requested mode. Record
+          // each non-lance run once with DFP_NA rather than duplicating it under on/off, which
+          // would produce meaningless duplicate rows.
+          String effectiveMode = "lance".equals(format) ? mode : BenchmarkResult.DFP_NA;
 
-        // Unregister tables for next format
+          System.out.println();
+          System.out.println("=== Format: " + format + " (dfp=" + effectiveMode + ") ===");
+          System.out.flush();
+
+          List<BenchmarkResult> formatResults = runner.runAllQueries(format, effectiveMode);
+          allResults.addAll(formatResults);
+
+          // For non-lance formats we only need one pass — skip any remaining modes in this
+          // format's inner loop.
+          if (!"lance".equals(format)) {
+            break;
+          }
+        }
+
         loader.unregisterTables();
       }
 
@@ -131,6 +180,8 @@ public class TpcdsBenchmarkRunner {
             + " [--iterations 3]"
             + " [--explain]"
             + " [--metrics]"
-            + " [--queries q1,q3,q14a]");
+            + " [--queries q1,q3,q14a]"
+            + " [--query-timeout-seconds 900]"
+            + " [--dfp-mode on|off|both|default]");
   }
 }
