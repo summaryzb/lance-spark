@@ -272,6 +272,19 @@ public class LanceScanBuilder
       }
     }
 
+    // Register the soft affinity listener so the consistent hash ring tracks executor lifecycle.
+    // Currently dead code on this branch — isDatasetCacheEnabled() returns false.
+    // Reactivate when the option becomes runtime-configurable (see plan typed-kindling-key.md).
+    if (org.lance.spark.internal.LanceExecutorCache.isEnabled()) {
+      try {
+        org.apache.spark.sql.SparkSession session = org.apache.spark.sql.SparkSession.active();
+        org.apache.spark.sql.lance.internal.LanceSoftAffinityListener$.MODULE$.ensureRegistered(
+            session.sparkContext());
+      } catch (Exception e) {
+        // SparkSession not available — affinity disabled, cache still works without hints.
+      }
+    }
+
     // Pre-compute fragment pruning so we can (a) estimate post-pruning statistics for
     // JoinSelection (BroadcastHashJoin vs SortMergeJoin) and (b) pass the cached result
     // to LanceScan to avoid re-computing during planInputPartitions().
@@ -350,19 +363,18 @@ public class LanceScanBuilder
     if (!readOptions.isPushDownFilters()) {
       return filters;
     }
+    // Pre-filter executor cache (V2): when the executor disk cache is enabled, skip all filter
+    // pushdown so each fragment scan returns raw projected columns. This is what lets the cache
+    // key drop the WHERE clause and share entries across queries with different predicates.
+    // Note: we cannot check readOptions.getVersion() here because version pinning happens later
+    // in getOrOpenDataset()/build(). The cache guard in LanceFragmentScanner.getArrowReader()
+    // does the full 3-way check at execution time.
+    if (org.lance.spark.internal.LanceExecutorCache.isEnabled()) {
+      pushedFilters = new Filter[0];
+      return filters;
+    }
     Filter[][] processFilters = FilterPushDown.processFilters(filters);
     pushedFilters = processFilters[0];
-    // Return ALL input filters, not just the ones we cannot push. This mirrors Iceberg's
-    // SparkScanBuilder.pushPredicates (classifies all pushable filters as "partially pushed"
-    // and returns them as post-scan). Rationale: Spark's optimizer rules that inject runtime
-    // filters — PartitionPruning (DPP/DFP) via hasSelectivePredicate, and InjectRuntimeFilter
-    // via extractBeneficialFilterCreatePlan — both pattern-match on a Filter(pred, scan) node
-    // above the relation. If we tell Spark "I fully handled it" (by returning only rejected
-    // filters), Spark eliminates the Filter node, the optimizer rules see a bare scan with no
-    // selective predicate, and no runtime filter gets injected on the probe side. The pushed
-    // subset (recorded in pushedFilters() below) is still pre-applied at scan time via Lance's
-    // where condition; Spark's re-evaluation above the scan is an idempotent pass-through on
-    // already-matching rows and costs negligible CPU.
     return filters;
   }
 

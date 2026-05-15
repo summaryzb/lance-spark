@@ -58,6 +58,8 @@ public class LanceInputPartition implements HasPartitionKey {
    */
   private final InternalRow partitionKeyRow;
 
+  private final String[] preferredCacheLocations;
+
   public LanceInputPartition(
       StructType schema,
       int partitionId,
@@ -73,6 +75,40 @@ public class LanceInputPartition implements HasPartitionKey {
       String namespaceImpl,
       Map<String, String> namespaceProperties,
       InternalRow partitionKeyRow) {
+    this(
+        schema,
+        partitionId,
+        lanceSplit,
+        readOptions,
+        whereCondition,
+        limit,
+        offset,
+        topNSortOrders,
+        pushedAggregation,
+        scanId,
+        initialStorageOptions,
+        namespaceImpl,
+        namespaceProperties,
+        partitionKeyRow,
+        new String[0]);
+  }
+
+  public LanceInputPartition(
+      StructType schema,
+      int partitionId,
+      LanceSplit lanceSplit,
+      LanceSparkReadOptions readOptions,
+      Optional<String> whereCondition,
+      Optional<Integer> limit,
+      Optional<Integer> offset,
+      Optional<List<ColumnOrdering>> topNSortOrders,
+      Optional<Aggregation> pushedAggregation,
+      String scanId,
+      Map<String, String> initialStorageOptions,
+      String namespaceImpl,
+      Map<String, String> namespaceProperties,
+      InternalRow partitionKeyRow,
+      String[] preferredCacheLocations) {
     this.schema = schema;
     this.partitionId = partitionId;
     this.lanceSplit = lanceSplit;
@@ -87,6 +123,14 @@ public class LanceInputPartition implements HasPartitionKey {
     this.namespaceImpl = namespaceImpl;
     this.namespaceProperties = namespaceProperties;
     this.partitionKeyRow = partitionKeyRow;
+    this.preferredCacheLocations = preferredCacheLocations;
+  }
+
+  @Override
+  public String[] preferredLocations() {
+    return preferredCacheLocations.length == 0
+        ? preferredCacheLocations
+        : java.util.Arrays.copyOf(preferredCacheLocations, preferredCacheLocations.length);
   }
 
   public StructType getSchema() {

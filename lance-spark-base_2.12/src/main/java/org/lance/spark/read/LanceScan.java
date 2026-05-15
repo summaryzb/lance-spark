@@ -323,14 +323,46 @@ public class LanceScan
     // fragment per InputPartition so the emitted partition key matches a single value. Also
     // skipped when a TopN is pushed, because multi-fragment per-partition scans would break
     // Lance's per-scan ordering contract.
-    prunedSplits = maybePackFragments(prunedSplits, planResult.getFragmentByteSizes());
-
+    if (!org.lance.spark.internal.LanceExecutorCache.isEnabled()) {
+      prunedSplits = maybePackFragments(prunedSplits, planResult.getFragmentByteSizes());
+    }
     // Capture as effectively final for use in lambda
     final List<LanceSplit> finalSplits = prunedSplits;
 
     // Use resolved version for snapshot isolation - ensures all workers read the same version
     LanceSparkReadOptions resolvedReadOptions =
         readOptions.withVersion((int) planResult.getResolvedVersion());
+
+    // Compute preferred locations via consistent hash affinity (deterministic, no runtime
+    // feedback).
+    String[][] affinityLocations = new String[finalSplits.size()][];
+    org.lance.spark.internal.LanceSoftAffinityManager affinity =
+        org.lance.spark.internal.LanceSoftAffinityManager.getInstance();
+    if (org.lance.spark.internal.LanceExecutorCache.isEnabled() && affinity.executorCount() > 0) {
+      java.util.Map<String, String> baseOpts =
+          resolvedReadOptions.getStorageOptions() != null
+              ? resolvedReadOptions.getStorageOptions()
+              : java.util.Collections.emptyMap();
+      java.util.Map<String, String> mergedOpts =
+          org.lance.spark.LanceRuntime.mergeStorageOptions(
+              baseOpts,
+              initialStorageOptions != null
+                  ? initialStorageOptions
+                  : java.util.Collections.emptyMap());
+      for (int idx = 0; idx < finalSplits.size(); idx++) {
+        int fragId = finalSplits.get(idx).getFragments().get(0);
+        org.lance.spark.internal.LanceExecutorCacheKey key =
+            new org.lance.spark.internal.LanceExecutorCacheKey(
+                resolvedReadOptions.getDatasetUri(),
+                resolvedReadOptions.getVersion(),
+                fragId,
+                resolvedReadOptions.getBatchSize(),
+                mergedOpts);
+        affinityLocations[idx] = affinity.getPreferredLocations(key.fingerprint());
+      }
+    } else {
+      java.util.Arrays.fill(affinityLocations, new String[0]);
+    }
 
     InputPartition[] result =
         IntStream.range(0, finalSplits.size())
@@ -356,7 +388,8 @@ public class LanceScan
                       initialStorageOptions,
                       namespaceImpl,
                       namespaceProperties,
-                      partKeyRow);
+                      partKeyRow,
+                      affinityLocations[i]);
                 })
             .toArray(InputPartition[]::new);
 
@@ -999,10 +1032,14 @@ public class LanceScan
     if (!similarScan(o)) {
       return java.util.Optional.empty();
     }
-    Filter[] newFilters =
-        new Filter[] {
-          new Or(combineFiltersWithAnd(this.pushedFilters), combineFiltersWithAnd(o.pushedFilters))
-        };
+    Filter[] newFilters = new Filter[0];
+    if (this.pushedFilters.length > 0 && this.pushedFilters.length > 0) {
+      newFilters =
+          new Filter[] {
+            new Or(
+                combineFiltersWithAnd(this.pushedFilters), combineFiltersWithAnd(o.pushedFilters))
+          };
+    }
     Optional<String> whereCondition = FilterPushDown.compileFiltersToSqlWhereClause(newFilters);
     zonemapStats.putAll(o.zonemapStats);
     return java.util.Optional.of(
