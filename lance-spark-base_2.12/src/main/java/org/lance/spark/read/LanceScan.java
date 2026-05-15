@@ -332,6 +332,37 @@ public class LanceScan
     LanceSparkReadOptions resolvedReadOptions =
         readOptions.withVersion((int) planResult.getResolvedVersion());
 
+    // Compute preferred locations via consistent hash affinity (deterministic, no runtime
+    // feedback).
+    String[][] affinityLocations = new String[finalSplits.size()][];
+    org.lance.spark.internal.LanceSoftAffinityManager affinity =
+        org.lance.spark.internal.LanceSoftAffinityManager.getInstance();
+    if (org.lance.spark.internal.LanceExecutorCache.isEnabled() && affinity.executorCount() > 0) {
+      java.util.Map<String, String> baseOpts =
+          resolvedReadOptions.getStorageOptions() != null
+              ? resolvedReadOptions.getStorageOptions()
+              : java.util.Collections.emptyMap();
+      java.util.Map<String, String> mergedOpts =
+          org.lance.spark.LanceRuntime.mergeStorageOptions(
+              baseOpts,
+              initialStorageOptions != null
+                  ? initialStorageOptions
+                  : java.util.Collections.emptyMap());
+      for (int idx = 0; idx < finalSplits.size(); idx++) {
+        int fragId = finalSplits.get(idx).getFragments().get(0);
+        org.lance.spark.internal.LanceExecutorCacheKey key =
+            new org.lance.spark.internal.LanceExecutorCacheKey(
+                resolvedReadOptions.getDatasetUri(),
+                resolvedReadOptions.getVersion(),
+                fragId,
+                resolvedReadOptions.getBatchSize(),
+                mergedOpts);
+        affinityLocations[idx] = affinity.getPreferredLocations(key.fingerprint());
+      }
+    } else {
+      java.util.Arrays.fill(affinityLocations, new String[0]);
+    }
+
     InputPartition[] result =
         IntStream.range(0, finalSplits.size())
             .mapToObj(
@@ -356,7 +387,8 @@ public class LanceScan
                       initialStorageOptions,
                       namespaceImpl,
                       namespaceProperties,
-                      partKeyRow);
+                      partKeyRow,
+                      affinityLocations[i]);
                 })
             .toArray(InputPartition[]::new);
 

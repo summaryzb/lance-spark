@@ -191,37 +191,84 @@ public class LanceFragmentScanner implements AutoCloseable {
    * @return the arrow reader. The caller is responsible for closing the reader
    */
   public ArrowReader getArrowReader() {
-    ArrowReader reader = scanner.scanBatches();
-    int queueDepth = inputPartition.getReadOptions().getBatchPrefetchQueueDepth();
-    if (queueDepth <= 0) {
-      return reader;
-    }
-    // Evaluate LanceRuntime.allocator() BEFORE calling the wrapper ctor so we can
-    // defend against a throw here: first-call-per-JVM lazily constructs a RootAllocator
-    // and can surface IllegalArgumentException from getAllocatorSize() or OOME from the
-    // allocator itself. Any throw before ownership transfers into the ctor leaves `reader`
-    // orphaned (Lance's native ArrowReader holds JNI buffers not reclaimed by GC), so we
-    // must close it here. Wrapping this call in its own try guarantees we only close on
-    // PRE-ownership failures — once the wrapper ctor starts, it owns the delegate and
-    // handles cleanup on its own throw paths (see PrefetchingArrowReader ctor), so a
-    // double-close on a non-idempotent JNI reader is avoided.
-    BufferAllocator parent;
-    try {
-      parent = LanceRuntime.allocator();
-    } catch (RuntimeException | Error e) {
+
+    LanceSparkReadOptions readOptions = inputPartition.getReadOptions();
+    BufferAllocator allocator = LanceRuntime.allocator();
+
+    ArrowReader reader;
+    boolean useExecutorCache = LanceExecutorCache.isEnabled() && readOptions.getVersion() != null;
+    if (useExecutorCache) {
+      LanceExecutorCacheKey execKey = buildExecutorCacheKey(readOptions);
+      java.util.List<String> projectedCols = getColumnNames(inputPartition.getSchema());
       try {
-        reader.close();
-      } catch (Exception closeEx) {
-        e.addSuppressed(closeEx);
+        reader =
+            LanceExecutorCache.getInstance()
+                .getOrLoadColumns(
+                    execKey, projectedCols, allocator, missCols -> scanner.scanBatches());
+      } catch (IOException e) {
+        throw new RuntimeException("load Lance fragment from executor disk cache", e);
       }
-      throw e;
+    } else {
+      reader = scanner.scanBatches();
+      int queueDepth = inputPartition.getReadOptions().getBatchPrefetchQueueDepth();
+      if (queueDepth <= 0) {
+        return reader;
+      }
+      // Evaluate LanceRuntime.allocator() BEFORE calling the wrapper ctor so we can
+      // defend against a throw here: first-call-per-JVM lazily constructs a RootAllocator
+      // and can surface IllegalArgumentException from getAllocatorSize() or OOME from the
+      // allocator itself. Any throw before ownership transfers into the ctor leaves `reader`
+      // orphaned (Lance's native ArrowReader holds JNI buffers not reclaimed by GC), so we
+      // must close it here. Wrapping this call in its own try guarantees we only close on
+      // PRE-ownership failures — once the wrapper ctor starts, it owns the delegate and
+      // handles cleanup on its own throw paths (see PrefetchingArrowReader ctor), so a
+      // double-close on a non-idempotent JNI reader is avoided.
+      BufferAllocator parent;
+      try {
+        parent = LanceRuntime.allocator();
+      } catch (RuntimeException | Error e) {
+        try {
+          reader.close();
+        } catch (Exception closeEx) {
+          e.addSuppressed(closeEx);
+        }
+        throw e;
+      }
+      // PrefetchingArrowReader's ctor takes ownership of `reader` and closes it on any
+      // post-ownership failure (schema read, child allocator / empty root creation, thread
+      // start). We therefore must NOT also close `reader` here — Lance's native ArrowReader
+      // is not idempotent under close(), and a second close on a JNI-backed reader can
+      // SIGSEGV on double-free of native buffers.
+      reader = new PrefetchingArrowReader(reader, queueDepth, parent);
     }
-    // PrefetchingArrowReader's ctor takes ownership of `reader` and closes it on any
-    // post-ownership failure (schema read, child allocator / empty root creation, thread
-    // start). We therefore must NOT also close `reader` here — Lance's native ArrowReader
-    // is not idempotent under close(), and a second close on a JNI-backed reader can
-    // SIGSEGV on double-free of native buffers.
-    return new PrefetchingArrowReader(reader, queueDepth, parent);
+    return reader;
+  }
+
+  /**
+   * Builds an {@link LanceExecutorCacheKey} identifying the decoded output of this fragment scan
+   * under the requested projection/batchSize. Merged-auth storage options (minus connector-owned
+   * keys) are hashed into the key so two queries with different credentials never share a cache
+   * slot.
+   *
+   * <p>The WHERE clause and projected columns are <b>not</b> part of the key — this is a per-column
+   * pre-filter cache. Each column is stored independently under the fragment directory, enabling
+   * partial hits across queries with different projections. {@code LanceScanBuilder.pushFilters}
+   * declines to push filters when the executor cache is enabled, so {@code scanner::scanBatches}
+   * returns unfiltered rows and Spark's {@code Filter} operator applies the predicate post-cache.
+   */
+  private LanceExecutorCacheKey buildExecutorCacheKey(LanceSparkReadOptions readOptions) {
+    java.util.Map<String, String> base =
+        readOptions.getStorageOptions() != null
+            ? readOptions.getStorageOptions()
+            : java.util.Collections.emptyMap();
+    java.util.Map<String, String> merged =
+        LanceRuntime.mergeStorageOptions(base, inputPartition.getInitialStorageOptions());
+    return new LanceExecutorCacheKey(
+        readOptions.getDatasetUri(),
+        readOptions.getVersion(),
+        fragmentId,
+        readOptions.getBatchSize(),
+        merged);
   }
 
   @Override

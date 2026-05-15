@@ -166,8 +166,27 @@ public class TpcdsBenchmarkRunner {
       reporter.writeCsv(csvPath);
       reporter.printSummary();
 
+      logLanceExecutorCacheSummary();
+
     } finally {
       spark.stop();
+    }
+  }
+
+  /**
+   * Invokes {@code LanceExecutorCache.logMetricsSummary("bench-end")} via reflection so the final
+   * hit/miss/eviction snapshot is emitted while the logging framework is still live. Direct linkage
+   * is avoided because the benchmark module has no dependency on {@code lance-spark-base}; the
+   * bundle jar provides the class at runtime via {@code --jars}. Silently no-ops if the class is
+   * absent (e.g. cache disabled / bundle not on classpath).
+   */
+  private static void logLanceExecutorCacheSummary() {
+    try {
+      Class<?> cacheClass = Class.forName("org.lance.spark.internal.LanceExecutorCache");
+      Object instance = cacheClass.getMethod("getInstance").invoke(null);
+      cacheClass.getMethod("logMetricsSummary", String.class).invoke(instance, "bench-end");
+    } catch (Throwable ignored) {
+      // Cache class not on classpath or cache disabled — nothing to report.
     }
   }
 

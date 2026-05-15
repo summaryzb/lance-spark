@@ -209,10 +209,7 @@ public class Utils {
       Optional<List<String>> tableId,
       String catalogName) {
     LanceSparkReadOptions.Builder builder =
-        LanceSparkReadOptions.builder()
-            .datasetUri(location)
-            .withCatalogDefaults(catalogConfig)
-            .catalogName(catalogName);
+        LanceSparkReadOptions.builder().datasetUri(location).catalogName(catalogName);
 
     if (versionId.isPresent()) {
       builder.version(versionId.get().intValue());
@@ -223,7 +220,7 @@ public class Utils {
     if (namespace.isPresent()) {
       builder.namespace(namespace.get());
     }
-
+    builder.withCatalogDefaults(catalogConfig);
     return builder.build();
   }
 

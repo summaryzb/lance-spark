@@ -94,6 +94,9 @@ public class LanceScanBuilderTest {
     // pushed subset is reported separately via pushedFilters() for EXPLAIN visibility and is
     // still pre-applied at scan time via the Lance where condition.
     Filter[] postScanFilters = builder.pushFilters(filters);
+    // New contract: always return the full input so Spark keeps its Filter op over the scan
+    // (preserves runtime filter inject, avoids cache-key correctness issues). `pushedFilters()`
+    // still reflects what Lance will evaluate internally for zonemap pruning / pushdown.
     assertEquals(3, postScanFilters.length);
     assertEquals(3, builder.pushedFilters().length);
   }
@@ -107,9 +110,7 @@ public class LanceScanBuilderTest {
           new GreaterThan("x", 1L), new StringContains("b", "test"),
         };
     Filter[] postScanFilters = builder.pushFilters(filters);
-    // All input filters are returned as post-scan (see testPushFiltersAllSupported comment).
     assertEquals(2, postScanFilters.length);
-    // Only the supported one is reported as pushed.
     assertEquals(1, builder.pushedFilters().length);
     assertInstanceOf(GreaterThan.class, builder.pushedFilters()[0]);
   }
@@ -235,8 +236,6 @@ public class LanceScanBuilderTest {
             Collections.emptyMap());
     Filter[] filters = new Filter[] {new GreaterThan("id", 1L)};
     Filter[] result = builder.pushFilters(filters);
-    // See testPushFiltersAllSupported: all input filters are returned as post-scan so
-    // Spark's Filter node survives for the DFP/runtime-filter optimizer rules.
     assertEquals(1, result.length);
     assertEquals(1, builder.pushedFilters().length);
   }
