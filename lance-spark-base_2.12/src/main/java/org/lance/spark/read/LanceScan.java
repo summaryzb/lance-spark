@@ -323,8 +323,9 @@ public class LanceScan
     // fragment per InputPartition so the emitted partition key matches a single value. Also
     // skipped when a TopN is pushed, because multi-fragment per-partition scans would break
     // Lance's per-scan ordering contract.
-    prunedSplits = maybePackFragments(prunedSplits, planResult.getFragmentByteSizes());
-
+    if (!org.lance.spark.internal.LanceExecutorCache.isEnabled()) {
+      prunedSplits = maybePackFragments(prunedSplits, planResult.getFragmentByteSizes());
+    }
     // Capture as effectively final for use in lambda
     final List<LanceSplit> finalSplits = prunedSplits;
 
@@ -1031,10 +1032,14 @@ public class LanceScan
     if (!similarScan(o)) {
       return java.util.Optional.empty();
     }
-    Filter[] newFilters =
-        new Filter[] {
-          new Or(combineFiltersWithAnd(this.pushedFilters), combineFiltersWithAnd(o.pushedFilters))
-        };
+    Filter[] newFilters = new Filter[0];
+    if (this.pushedFilters.length > 0 && this.pushedFilters.length > 0) {
+      newFilters =
+          new Filter[] {
+            new Or(
+                combineFiltersWithAnd(this.pushedFilters), combineFiltersWithAnd(o.pushedFilters))
+          };
+    }
     Optional<String> whereCondition = FilterPushDown.compileFiltersToSqlWhereClause(newFilters);
     zonemapStats.putAll(o.zonemapStats);
     return java.util.Optional.of(

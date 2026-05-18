@@ -19,9 +19,9 @@
 | 拦截点 | `LanceFragmentScanner.getArrowReader()` |
 | Cache key | `(datasetUri, pinnedVersion, fragmentId, batchSize, authOptsDigest)` — **不含列投影、不含 filter** |
 | Cache value | 每列独立的 Arrow IPC stream 文件 |
-| 目录结构 | `{cacheDir}/executor-{id}/{fingerprint}/{colName}.arrow` |
-| 存储位置 | env `LANCE_EXEC_CACHE_DIR`（默认 `spark.local.dir/lance-cache`）|
-| 每 executor 容量 | 独立预算，env `LANCE_EXEC_CACHE_DISK_LIMIT_GB`（默认 30 GB）|
+| 目录结构 | `{cacheDir_i}/lance-cache/executor-{id}/{fingerprint}/{colName}.arrow`，fragment 通过 `floorMod(fingerprint.hashCode(), N)` 静态分配到 `cacheDir_i` |
+| 存储位置 | env `LOCAL_DIRS`（YARN 注入的多盘逗号串，全部使用），fallback 到 sysprop `spark.local.dir` 再到 `java.io.tmpdir` |
+| 每 executor 容量 | **每盘独立**预算，env `LANCE_EXEC_CACHE_DISK_LIMIT_GB`（默认 300 GB），总容量 = N × limit |
 | 淘汰策略 | LRU（按最近访问时间），淘汰单位 = 整个 fragment 目录 |
 | 并发 | per-fingerprint `ReentrantLock`，eviction 在 lock 外执行 |
 | 调度亲和性 | **一致性 hash**（fragment fingerprint → executor），`preferredLocations` 实现 PROCESS_LOCAL |
@@ -93,7 +93,7 @@ DAGScheduler                              │                                   
 
 | 文件 | 职责 |
 |---|---|
-| `LanceExecutorCache.java` | per-column 目录结构 + getOrLoadColumns + LRU eviction + metrics |
+| `LanceExecutorCache.java` | per-column 目录结构 + 多盘哈希分配 + getOrLoadColumns + 每盘独立 LRU eviction + metrics |
 | `LanceExecutorCacheKey.java` | 不可变 cache key + SHA-256 fingerprint |
 | `ColumnAssemblingArrowReader.java` | 拼装 N 个单列 ArrowReader 为多列 VectorSchemaRoot |
 | `LanceConsistentHash.java` | 一致性 hash ring（ThreadLocal SHA-256, ReadWriteLock） |
@@ -112,10 +112,10 @@ DAGScheduler                              │                                   
 | Env 变量 | 默认值 | 说明 |
 |---|---|---|
 | `LANCE_EXEC_CACHE_ENABLED` | `false` | 总开关（opt-in）|
-| `LANCE_EXEC_CACHE_DIR` | `spark.local.dir/lance-cache` | 磁盘根目录（每 executor 自动加 `executor-{id}` 子目录）|
-| `LANCE_EXEC_CACHE_DISK_LIMIT_GB` | `30` | 每 executor 磁盘上限 |
+| `LOCAL_DIRS` | sysprop `spark.local.dir` → `java.io.tmpdir` | 磁盘根目录列表，逗号分隔；YARN cluster 模式 NodeManager 自动注入。每个目录默认视为一块独立磁盘（不做物理校验），cache 通过 fingerprint 哈希取模把 fragment 分散到各盘并行 IO。每 executor 自动追加 `lance-cache/executor-{id}` 子目录|
+| `LANCE_EXEC_CACHE_DISK_LIMIT_GB` | `300` | **每盘**磁盘上限；总容量 = N × limit |
 
-local-cluster / standalone 模式下需同时设 `spark.executorEnv.LANCE_EXEC_CACHE_*`。
+local-cluster / standalone 模式下需同时设 `spark.executorEnv.LANCE_EXEC_CACHE_ENABLED` 等。多盘可通过 `spark.executorEnv.LOCAL_DIRS=/disk1,/disk2,/disk3` 注入。
 
 ---
 

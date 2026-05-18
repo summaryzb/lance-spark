@@ -57,11 +57,12 @@ object LanceSoftAffinityListener extends Logging {
           if (exec.id != "driver") {
             val host = extractHost(exec.hostPort)
             LanceSoftAffinityManager.getInstance().onExecutorAdded(exec.id, host)
+            logInfo(s"LanceSoftAffinityListener registered ${exec.id}")
           }
         }
         sc.addSparkListener(new LanceSoftAffinityListener())
         registered = true
-        logInfo("LanceSoftAffinityListener registered")
+        logInfo("LanceSoftAffinityListener registered finish")
       } catch {
         case NonFatal(t) =>
           logWarning(s"Failed to register LanceSoftAffinityListener: ${t.getMessage}")

@@ -34,6 +34,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -50,8 +51,14 @@ import java.util.function.Function;
  * cache hits — if query A reads columns [a, b, c] and query B reads [b, c, d], columns b and c are
  * served from cache while only column d triggers a Lance decode.
  *
- * <p>LRU eviction operates at the fragment-directory level: when disk usage exceeds the limit,
- * entire fragment directories (all their column files) are deleted from the LRU head.
+ * <p>Multiple cache root directories (typically one per local disk) are supported. Fragments are
+ * statically assigned to a disk via {@code Math.floorMod(fingerprint.hashCode(), N)}, so all column
+ * files of a given fragment live on the same disk and reads only inspect that disk. The disk
+ * capacity limit ({@code LANCE_EXEC_CACHE_DISK_LIMIT_GB}) is applied <em>per disk</em>; total cache
+ * capacity is {@code N * limit}.
+ *
+ * <p>LRU eviction operates at the fragment-directory level and is independent per disk: when one
+ * disk exceeds its limit, only fragments mapped to that disk are evicted from the LRU head.
  */
 public final class LanceExecutorCache {
   private static final Logger LOG = LoggerFactory.getLogger(LanceExecutorCache.class);
@@ -72,7 +79,7 @@ public final class LanceExecutorCache {
       synchronized (LanceExecutorCache.class) {
         local = instance;
         if (local == null) {
-          local = new LanceExecutorCache(resolveCacheDir(), resolveDiskLimit());
+          local = new LanceExecutorCache(resolveCacheDirs(), resolveDiskLimit());
           instance = local;
           registerShutdownHook(local);
           LanceExecutorCacheMetricsSource.registerIfSparkAvailable(local);
@@ -108,15 +115,23 @@ public final class LanceExecutorCache {
     return v != null && !v.isEmpty() && !"false".equalsIgnoreCase(v) && !"0".equals(v);
   }
 
-  private static Path resolveCacheDir() {
-    String dir = System.getenv(ENV_CACHE_DIR);
-    if (dir == null || dir.isEmpty()) {
-      String sparkLocal =
-          System.getProperty("spark.local.dir", System.getProperty("java.io.tmpdir"));
-      String first = sparkLocal.split(",", 2)[0];
-      dir = Paths.get(first, "lance-cache").toString();
+  private static Path[] resolveCacheDirs() {
+    String raw = System.getenv(ENV_CACHE_DIR);
+    if (raw == null || raw.isEmpty()) {
+      raw = System.getProperty("spark.local.dir", System.getProperty("java.io.tmpdir"));
     }
-    return Paths.get(dir, resolveExecutorId());
+    String[] parts = raw.split(",");
+    String execId = resolveExecutorId();
+    List<Path> dirs = new ArrayList<>(parts.length);
+    for (String p : parts) {
+      String trimmed = p == null ? "" : p.trim();
+      if (trimmed.isEmpty()) continue;
+      dirs.add(Paths.get(trimmed, "lance-cache", execId));
+    }
+    if (dirs.isEmpty()) {
+      dirs.add(Paths.get(System.getProperty("java.io.tmpdir"), "lance-cache", execId));
+    }
+    return dirs.toArray(new Path[0]);
   }
 
   private static String resolveExecutorId() {
@@ -148,10 +163,10 @@ public final class LanceExecutorCache {
   }
 
   // --- Instance state ---
-  private final Path cacheDir;
-  private final long diskLimitBytes;
-  private final LinkedHashMap<String, Long> lruIndex; // fingerprint -> dir total bytes
-  private final AtomicLong totalBytes = new AtomicLong(0);
+  private final Path[] cacheDirs;
+  private final long diskLimitBytes; // per-disk
+  private final LinkedHashMap<String, Long>[] lruIndexPerDir; // fingerprint -> dir bytes
+  private final AtomicLong[] bytesPerDir;
   private final ConcurrentHashMap<String, ReentrantLock> keyLocks = new ConcurrentHashMap<>();
   private final AtomicLong hits = new AtomicLong(0);
   private final AtomicLong misses = new AtomicLong(0);
@@ -159,26 +174,52 @@ public final class LanceExecutorCache {
   private final AtomicLong evictions = new AtomicLong(0);
   private final AtomicLong writeFailures = new AtomicLong(0);
 
+  /** Convenience for single-dir callers (legacy / tests). */
   LanceExecutorCache(Path cacheDir, long diskLimitBytes) {
-    this.cacheDir = cacheDir;
+    this(new Path[] {cacheDir}, diskLimitBytes);
+  }
+
+  @SuppressWarnings("unchecked")
+  LanceExecutorCache(Path[] cacheDirs, long diskLimitBytes) {
+    if (cacheDirs == null || cacheDirs.length == 0) {
+      throw new IllegalArgumentException("cacheDirs must be non-empty");
+    }
+    this.cacheDirs = cacheDirs.clone();
     this.diskLimitBytes = diskLimitBytes;
-    this.lruIndex = new LinkedHashMap<>(32, 0.75f, true);
-    try {
-      Files.createDirectories(cacheDir);
-    } catch (IOException e) {
-      throw new IllegalStateException("Failed to create cache dir " + cacheDir, e);
+    this.lruIndexPerDir = (LinkedHashMap<String, Long>[]) new LinkedHashMap[this.cacheDirs.length];
+    this.bytesPerDir = new AtomicLong[this.cacheDirs.length];
+    for (int i = 0; i < this.cacheDirs.length; i++) {
+      this.lruIndexPerDir[i] = new LinkedHashMap<>(32, 0.75f, true);
+      this.bytesPerDir[i] = new AtomicLong(0);
+      try {
+        Files.createDirectories(this.cacheDirs[i]);
+      } catch (IOException e) {
+        throw new IllegalStateException("Failed to create cache dir " + this.cacheDirs[i], e);
+      }
     }
     rebuildIndex();
     LOG.info(
-        "LanceExecutorCache initialized: dir={} limit={}GB entries={} size={}MB",
-        cacheDir,
+        "LanceExecutorCache initialized: dirs={} perDiskLimit={}GB entries={} sizeMB={}",
+        Arrays.toString(this.cacheDirs),
         diskLimitBytes / (1024 * 1024 * 1024),
-        lruIndex.size(),
-        totalBytes.get() / (1024 * 1024));
+        entryCount(),
+        totalBytes() / (1024 * 1024));
+  }
+
+  private int bucketFor(String fingerprint) {
+    if (cacheDirs.length == 1) return 0;
+    return Math.floorMod(fingerprint.hashCode(), cacheDirs.length);
   }
 
   private void rebuildIndex() {
-    try (java.util.stream.Stream<Path> dirs = Files.list(cacheDir)) {
+    for (int i = 0; i < cacheDirs.length; i++) {
+      rebuildIndexFor(i);
+    }
+  }
+
+  private void rebuildIndexFor(int diskIdx) {
+    Path root = cacheDirs[diskIdx];
+    try (java.util.stream.Stream<Path> dirs = Files.list(root)) {
       java.util.List<Path> fragDirs = new java.util.ArrayList<>();
       dirs.forEach(
           p -> {
@@ -200,16 +241,17 @@ public final class LanceExecutorCache {
               return 0;
             }
           });
-      synchronized (lruIndex) {
+      LinkedHashMap<String, Long> lru = lruIndexPerDir[diskIdx];
+      synchronized (lru) {
         for (Path dir : fragDirs) {
           long dirSize = computeDirSize(dir);
           String fp = dir.getFileName().toString();
-          lruIndex.put(fp, dirSize);
-          totalBytes.addAndGet(dirSize);
+          lru.put(fp, dirSize);
+          bytesPerDir[diskIdx].addAndGet(dirSize);
         }
       }
     } catch (IOException e) {
-      LOG.warn("Failed to scan cache directory {}: {}", cacheDir, e.getMessage());
+      LOG.warn("Failed to scan cache directory {}: {}", root, e.getMessage());
     }
   }
 
@@ -240,8 +282,9 @@ public final class LanceExecutorCache {
   }
 
   private Path fragDir(String fingerprint) {
-    Path resolved = cacheDir.resolve(fingerprint);
-    if (!resolved.startsWith(cacheDir)) {
+    Path base = cacheDirs[bucketFor(fingerprint)];
+    Path resolved = base.resolve(fingerprint);
+    if (!resolved.startsWith(base)) {
       throw new IllegalArgumentException("Fingerprint escapes cache dir: " + fingerprint);
     }
     return resolved;
@@ -412,12 +455,14 @@ public final class LanceExecutorCache {
         Files.move(tmp, fin, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         addedBytes += Files.size(fin);
       }
-      synchronized (lruIndex) {
-        Long prev = lruIndex.getOrDefault(fingerprint, 0L);
-        lruIndex.put(fingerprint, prev + addedBytes);
-        totalBytes.addAndGet(addedBytes);
+      int diskIdx = bucketFor(fingerprint);
+      LinkedHashMap<String, Long> lru = lruIndexPerDir[diskIdx];
+      synchronized (lru) {
+        Long prev = lru.getOrDefault(fingerprint, 0L);
+        lru.put(fingerprint, prev + addedBytes);
+        bytesPerDir[diskIdx].addAndGet(addedBytes);
       }
-      evictIfOverLimit();
+      evictIfOverLimit(diskIdx);
     } catch (Throwable t) {
       failure = t;
       for (ArrowStreamWriter w : writers) {
@@ -466,21 +511,24 @@ public final class LanceExecutorCache {
   }
 
   private void touchLruEntry(String fingerprint) {
-    synchronized (lruIndex) {
-      lruIndex.get(fingerprint); // access-order update
+    LinkedHashMap<String, Long> lru = lruIndexPerDir[bucketFor(fingerprint)];
+    synchronized (lru) {
+      lru.get(fingerprint); // access-order update
     }
   }
 
-  private void evictIfOverLimit() {
+  private void evictIfOverLimit(int diskIdx) {
     List<String> toDelete = new ArrayList<>();
     List<Long> sizes = new ArrayList<>();
-    synchronized (lruIndex) {
-      while (totalBytes.get() > diskLimitBytes && lruIndex.size() > 1) {
-        java.util.Map.Entry<String, Long> oldest = lruIndex.entrySet().iterator().next();
+    LinkedHashMap<String, Long> lru = lruIndexPerDir[diskIdx];
+    AtomicLong bytes = bytesPerDir[diskIdx];
+    synchronized (lru) {
+      while (bytes.get() > diskLimitBytes && lru.size() > 1) {
+        java.util.Map.Entry<String, Long> oldest = lru.entrySet().iterator().next();
         String victimFp = oldest.getKey();
         long victimSize = oldest.getValue();
-        lruIndex.remove(victimFp);
-        totalBytes.addAndGet(-victimSize);
+        lru.remove(victimFp);
+        bytes.addAndGet(-victimSize);
         toDelete.add(victimFp);
         sizes.add(victimSize);
       }
@@ -489,9 +537,9 @@ public final class LanceExecutorCache {
       if (deleteDirectory(fragDir(toDelete.get(i)))) {
         evictions.incrementAndGet();
       } else {
-        synchronized (lruIndex) {
-          lruIndex.put(toDelete.get(i), sizes.get(i));
-          totalBytes.addAndGet(sizes.get(i));
+        synchronized (lru) {
+          lru.put(toDelete.get(i), sizes.get(i));
+          bytes.addAndGet(sizes.get(i));
         }
         LOG.warn(
             "Failed to evict cache dir for fp={}; re-inserting into LRU",
@@ -530,19 +578,38 @@ public final class LanceExecutorCache {
     long h = hits(), m = misses(), ph = partialHits();
     long total = h + m + ph;
     double rate = total == 0 ? 0.0 : (double) (h + ph) / total;
-    return String.format(
-        java.util.Locale.ROOT,
-        "LanceExecutorCache[%s] hits=%d partialHits=%d misses=%d hitRate=%.3f"
-            + " evictions=%d entries=%d diskMB=%d writeFailures=%d",
-        context,
-        h,
-        ph,
-        m,
-        rate,
-        evictions(),
-        entryCount(),
-        totalBytes() / (1024 * 1024),
-        writeFailures());
+    StringBuilder sb = new StringBuilder();
+    sb.append(
+        String.format(
+            java.util.Locale.ROOT,
+            "LanceExecutorCache[%s] hits=%d partialHits=%d misses=%d hitRate=%.3f"
+                + " evictions=%d entries=%d diskMB=%d writeFailures=%d",
+            context,
+            h,
+            ph,
+            m,
+            rate,
+            evictions(),
+            entryCount(),
+            totalBytes() / (1024 * 1024),
+            writeFailures()));
+    if (cacheDirs.length > 1) {
+      for (int i = 0; i < cacheDirs.length; i++) {
+        int n;
+        synchronized (lruIndexPerDir[i]) {
+          n = lruIndexPerDir[i].size();
+        }
+        sb.append(
+            String.format(
+                java.util.Locale.ROOT,
+                " disk[%d]=%s entries=%d sizeMB=%d",
+                i,
+                cacheDirs[i],
+                n,
+                bytesPerDir[i].get() / (1024 * 1024)));
+      }
+    }
+    return sb.toString();
   }
 
   private void maybeLogPeriodic() {
@@ -574,13 +641,19 @@ public final class LanceExecutorCache {
   }
 
   public long totalBytes() {
-    return totalBytes.get();
+    long sum = 0;
+    for (AtomicLong b : bytesPerDir) sum += b.get();
+    return sum;
   }
 
   public int entryCount() {
-    synchronized (lruIndex) {
-      return lruIndex.size();
+    int n = 0;
+    for (LinkedHashMap<String, Long> lru : lruIndexPerDir) {
+      synchronized (lru) {
+        n += lru.size();
+      }
     }
+    return n;
   }
 
   public double hitRate() {
@@ -589,7 +662,7 @@ public final class LanceExecutorCache {
     return total == 0 ? 0.0 : (double) (h + ph) / total;
   }
 
-  Path getCacheDir() {
-    return cacheDir;
+  Path[] getCacheDirs() {
+    return cacheDirs.clone();
   }
 }
