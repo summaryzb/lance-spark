@@ -26,7 +26,6 @@ import org.slf4j.LoggerFactory;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -38,6 +37,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
@@ -168,6 +168,18 @@ public final class LanceExecutorCache {
   private final LinkedHashMap<String, Long>[] lruIndexPerDir; // fingerprint -> dir bytes
   private final AtomicLong[] bytesPerDir;
   private final ConcurrentHashMap<String, ReentrantLock> keyLocks = new ConcurrentHashMap<>();
+
+  /**
+   * Lock-free fast-path index: fingerprint -> set of column names known to be present on disk.
+   *
+   * <p>Hydrated lazily by the slow path of {@link #getOrLoadColumns} after a successful drain, and
+   * eagerly at startup by {@link #rebuildIndexFor}. Cleared per-fragment when an entry is evicted
+   * or when the fast path detects that an underlying column file has vanished (eviction race). The
+   * fast path uses {@code containsAll(requestedColumns)} to decide whether to skip the per-fragment
+   * lock entirely.
+   */
+  private final ConcurrentHashMap<String, Set<String>> presentCols = new ConcurrentHashMap<>();
+
   private final AtomicLong hits = new AtomicLong(0);
   private final AtomicLong misses = new AtomicLong(0);
   private final AtomicLong partialHits = new AtomicLong(0);
@@ -248,6 +260,25 @@ public final class LanceExecutorCache {
           String fp = dir.getFileName().toString();
           lru.put(fp, dirSize);
           bytesPerDir[diskIdx].addAndGet(dirSize);
+          // Hydrate the lock-free index by listing column files inside the fragment dir.
+          // Names are filename-derived (sans .arrow). Columns whose original names contain
+          // characters mangled by sanitizeColName() will degrade to slow-path lookup, but
+          // remain functionally correct because the slow path applies the same sanitize.
+          Set<String> cols = ConcurrentHashMap.newKeySet();
+          try (java.util.stream.Stream<Path> colFiles = Files.list(dir)) {
+            colFiles.forEach(
+                f -> {
+                  String name = f.getFileName().toString();
+                  if (name.endsWith(ARROW_SUFFIX)) {
+                    cols.add(name.substring(0, name.length() - ARROW_SUFFIX.length()));
+                  }
+                });
+          } catch (IOException ignored) {
+            LOG.trace("ignored", ignored);
+          }
+          if (!cols.isEmpty()) {
+            presentCols.put(fp, cols);
+          }
         }
       }
     } catch (IOException e) {
@@ -323,8 +354,22 @@ public final class LanceExecutorCache {
       Function<List<String>, ArrowReader> columnLoader)
       throws IOException {
     String fp = key.fingerprint();
-    Path dir = fragDir(fp);
 
+    // ---- Fast path: lock-free probe ----
+    Set<String> known = presentCols.get(fp);
+    if (known != null && known.containsAll(requestedColumns)) {
+      ArrowReader fastReader = tryOpenAllColumns(fp, requestedColumns, allocator);
+      if (fastReader != null) {
+        hits.incrementAndGet();
+        maybeLogPeriodic();
+        touchLruEntry(fp);
+        return fastReader;
+      }
+      // Fast path saw an evicted column file; fall through to slow path which will redrain.
+    }
+
+    // ---- Slow path: per-fragment lock ----
+    Path dir = fragDir(fp);
     ReentrantLock lock = keyLocks.computeIfAbsent(fp, k -> new ReentrantLock());
     lock.lock();
     try {
@@ -352,29 +397,77 @@ public final class LanceExecutorCache {
         drainMissColumns(fp, missCols, allocator, columnLoader);
       }
 
-      touchLruEntry(fp);
+      // Hydrate the lock-free index now that all requested columns are confirmed on disk.
+      Set<String> cols = presentCols.computeIfAbsent(fp, k -> ConcurrentHashMap.newKeySet());
+      cols.addAll(hitCols);
+      cols.addAll(missCols);
 
-      List<ArrowReader> colReaders = new ArrayList<>(requestedColumns.size());
-      try {
-        for (String col : requestedColumns) {
-          colReaders.add(openColumnReader(fp, col, allocator));
-        }
-        return new ColumnAssemblingArrowReader(allocator, colReaders);
-      } catch (Throwable t) {
-        for (ArrowReader r : colReaders) {
-          try {
-            r.close();
-          } catch (IOException suppressed) {
-            t.addSuppressed(suppressed);
-          }
-        }
-        if (t instanceof IOException) throw (IOException) t;
-        if (t instanceof RuntimeException) throw (RuntimeException) t;
-        throw new IOException("Failed to open cached column readers", t);
-      }
+      touchLruEntry(fp);
+      return assembleReaders(fp, requestedColumns, allocator);
     } finally {
       lock.unlock();
-      keyLocks.remove(fp, lock);
+      // Intentionally NOT keyLocks.remove(fp, lock): prior versions removed here, which
+      // races with concurrent computeIfAbsent and can yield two distinct ReentrantLocks
+      // for the same fingerprint, breaking mutual exclusion in drainMissColumns. Lock
+      // entries are bounded (~40B each) and cleaned up alongside the fragment dir in
+      // evictIfOverLimit.
+    }
+  }
+
+  /**
+   * Lock-free fast-path attempt to open all column readers without holding {@link #keyLocks}.
+   *
+   * <p>Returns a fully-assembled reader on success, or {@code null} if a column file vanished
+   * mid-open (eviction race), in which case the caller must fall through to the slow path. Other
+   * failures are rethrown.
+   */
+  private ArrowReader tryOpenAllColumns(
+      String fp, List<String> requestedColumns, BufferAllocator allocator) throws IOException {
+    List<ArrowReader> opened = new ArrayList<>(requestedColumns.size());
+    try {
+      for (String col : requestedColumns) {
+        opened.add(openColumnReader(fp, col, allocator));
+      }
+      return new ColumnAssemblingArrowReader(allocator, opened);
+    } catch (java.nio.file.NoSuchFileException missing) {
+      closeAll(opened, missing);
+      // Self-heal: the in-memory index claimed this fragment had the column, but eviction
+      // or an external cleanup removed the file. Drop the index entry so subsequent calls
+      // go through the slow path, which re-derives state from Files.exists.
+      presentCols.remove(fp);
+      return null;
+    } catch (Throwable t) {
+      closeAll(opened, t);
+      if (t instanceof IOException) throw (IOException) t;
+      if (t instanceof RuntimeException) throw (RuntimeException) t;
+      throw new IOException("Failed to open cached column readers", t);
+    }
+  }
+
+  /** Open every requested column file (assumed present) and wrap into a single ArrowReader. */
+  private ArrowReader assembleReaders(
+      String fp, List<String> requestedColumns, BufferAllocator allocator) throws IOException {
+    List<ArrowReader> colReaders = new ArrayList<>(requestedColumns.size());
+    try {
+      for (String col : requestedColumns) {
+        colReaders.add(openColumnReader(fp, col, allocator));
+      }
+      return new ColumnAssemblingArrowReader(allocator, colReaders);
+    } catch (Throwable t) {
+      closeAll(colReaders, t);
+      if (t instanceof IOException) throw (IOException) t;
+      if (t instanceof RuntimeException) throw (RuntimeException) t;
+      throw new IOException("Failed to open cached column readers", t);
+    }
+  }
+
+  private static void closeAll(List<ArrowReader> readers, Throwable suppressTarget) {
+    for (ArrowReader r : readers) {
+      try {
+        r.close();
+      } catch (Exception suppressed) {
+        suppressTarget.addSuppressed(suppressed);
+      }
     }
   }
 
@@ -507,7 +600,7 @@ public final class LanceExecutorCache {
       String fingerprint, String colName, BufferAllocator allocator) throws IOException {
     Path file = colFile(fingerprint, colName);
     return new ArrowStreamReader(
-        new BufferedInputStream(new FileInputStream(file.toFile()), 1 << 20), allocator);
+        new BufferedInputStream(Files.newInputStream(file), 1 << 20), allocator);
   }
 
   private void touchLruEntry(String fingerprint) {
@@ -534,16 +627,22 @@ public final class LanceExecutorCache {
       }
     }
     for (int i = 0; i < toDelete.size(); i++) {
-      if (deleteDirectory(fragDir(toDelete.get(i)))) {
+      String victimFp = toDelete.get(i);
+      if (deleteDirectory(fragDir(victimFp))) {
+        // Synchronize lock-free index and per-fragment lock map with on-disk state.
+        // Without this, presentCols would falsely report cached columns and keyLocks
+        // would grow unboundedly across the cache lifetime.
+        presentCols.remove(victimFp);
+        keyLocks.remove(victimFp);
         evictions.incrementAndGet();
       } else {
         synchronized (lru) {
-          lru.put(toDelete.get(i), sizes.get(i));
+          lru.put(victimFp, sizes.get(i));
           bytes.addAndGet(sizes.get(i));
         }
         LOG.warn(
             "Failed to evict cache dir for fp={}; re-inserting into LRU",
-            toDelete.get(i).substring(0, Math.min(12, toDelete.get(i).length())));
+            victimFp.substring(0, Math.min(12, victimFp.length())));
       }
     }
   }
@@ -664,5 +763,19 @@ public final class LanceExecutorCache {
 
   Path[] getCacheDirs() {
     return cacheDirs.clone();
+  }
+
+  // --- Test-only accessors (package-private) ---
+  int presentColsSizeForTest() {
+    return presentCols.size();
+  }
+
+  int keyLocksSizeForTest() {
+    return keyLocks.size();
+  }
+
+  Set<String> presentColsForTest(String fingerprint) {
+    Set<String> s = presentCols.get(fingerprint);
+    return s == null ? Collections.emptySet() : Collections.unmodifiableSet(s);
   }
 }
