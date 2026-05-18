@@ -111,7 +111,12 @@ public final class LanceExecutorCache {
   }
 
   public static boolean isEnabled() {
-    String v = System.getenv(ENV_ENABLED);
+    // Property takes precedence over env so tests can flip the gate without OS-level env mutation
+    // (which is brittle on JDK 17 where ProcessEnvironment uses byte-array keys, not Strings).
+    String v = System.getProperty(ENV_ENABLED);
+    if (v == null || v.isEmpty()) {
+      v = System.getenv(ENV_ENABLED);
+    }
     return v != null && !v.isEmpty() && !"false".equalsIgnoreCase(v) && !"0".equals(v);
   }
 

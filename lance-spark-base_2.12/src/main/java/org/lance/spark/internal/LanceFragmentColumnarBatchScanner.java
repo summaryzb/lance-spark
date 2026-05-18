@@ -16,6 +16,7 @@ package org.lance.spark.internal;
 import org.lance.Dataset;
 import org.lance.spark.LanceConstant;
 import org.lance.spark.read.LanceInputPartition;
+import org.lance.spark.utils.LazyResource;
 import org.lance.spark.vectorized.BlobStructAccessor;
 import org.lance.spark.vectorized.LanceArrowColumnVector;
 
@@ -56,16 +57,20 @@ public class LanceFragmentColumnarBatchScanner implements AutoCloseable {
   }
 
   /**
-   * Variant that reuses a dataset opened by the caller. The returned scanner will NOT close the
-   * dataset when {@link #close()} is invoked; lifecycle responsibility stays with the caller.
+   * Variant that reuses a dataset supplier opened lazily by the caller. The returned scanner will
+   * NOT close the dataset when {@link #close()} is invoked; lifecycle responsibility stays with the
+   * caller.
    *
    * <p>Used by {@link org.lance.spark.read.LanceColumnarPartitionReader} when one partition packs
-   * multiple fragments — avoids re-opening the dataset per fragment.
+   * multiple fragments — avoids re-opening the dataset per fragment AND skips opening at all when
+   * every fragment is served from the executor disk cache.
    */
   public static LanceFragmentColumnarBatchScanner create(
-      int fragmentId, LanceInputPartition inputPartition, Dataset sharedDataset) {
+      int fragmentId,
+      LanceInputPartition inputPartition,
+      LazyResource<Dataset> sharedDatasetSupplier) {
     LanceFragmentScanner fragmentScanner =
-        LanceFragmentScanner.create(fragmentId, inputPartition, sharedDataset);
+        LanceFragmentScanner.create(fragmentId, inputPartition, sharedDatasetSupplier);
     return new LanceFragmentColumnarBatchScanner(fragmentScanner, fragmentScanner.getArrowReader());
   }
 

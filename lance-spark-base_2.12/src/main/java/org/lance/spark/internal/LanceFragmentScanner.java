@@ -21,6 +21,7 @@ import org.lance.spark.LanceConstant;
 import org.lance.spark.LanceRuntime;
 import org.lance.spark.LanceSparkReadOptions;
 import org.lance.spark.read.LanceInputPartition;
+import org.lance.spark.utils.LazyResource;
 import org.lance.spark.utils.Utils;
 
 import org.apache.arrow.memory.BufferAllocator;
@@ -34,27 +35,28 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 public class LanceFragmentScanner implements AutoCloseable {
-  private final Dataset dataset;
-  private final LanceScanner scanner;
+  private final LazyResource<Dataset> datasetSupplier;
+  private final LazyResource<LanceScanner> scannerSupplier;
   private final int fragmentId;
   private final boolean withFragemtId;
   private final LanceInputPartition inputPartition;
 
   /**
-   * When true, {@link #dataset} is owned externally by the caller (e.g. a per-partition reader that
-   * shares a single dataset across many fragments). {@link #close()} will NOT close it.
+   * When true, {@link #datasetSupplier} is owned externally by the caller (e.g. a per-partition
+   * reader that shares one dataset across many fragments). {@link #close()} will NOT close the
+   * dataset even if it has been initialized.
    */
   private final boolean datasetExternallyOwned;
 
   private LanceFragmentScanner(
-      Dataset dataset,
-      LanceScanner scanner,
+      LazyResource<Dataset> datasetSupplier,
+      LazyResource<LanceScanner> scannerSupplier,
       int fragmentId,
       boolean withFragmentId,
       LanceInputPartition inputPartition,
       boolean datasetExternallyOwned) {
-    this.dataset = dataset;
-    this.scanner = scanner;
+    this.datasetSupplier = datasetSupplier;
+    this.scannerSupplier = scannerSupplier;
     this.fragmentId = fragmentId;
     this.withFragemtId = withFragmentId;
     this.inputPartition = inputPartition;
@@ -62,186 +64,178 @@ public class LanceFragmentScanner implements AutoCloseable {
   }
 
   public static LanceFragmentScanner create(int fragmentId, LanceInputPartition inputPartition) {
-    return createInternal(fragmentId, inputPartition, null);
+    LazyResource<Dataset> owned = new LazyResource<>(() -> openDataset(inputPartition));
+    return buildScanner(fragmentId, inputPartition, owned, /* externallyOwned= */ false);
   }
 
   /**
-   * Variant that reuses a dataset opened by the caller. The returned scanner will NOT close the
-   * dataset when {@link #close()} is invoked; lifecycle responsibility stays with the caller.
+   * Variant that reuses a dataset supplier opened by the caller. The returned scanner will NOT
+   * close the dataset when {@link #close()} is invoked; lifecycle responsibility stays with the
+   * caller.
    *
    * <p>Used by {@link org.lance.spark.read.LanceColumnarPartitionReader} when one partition packs
-   * multiple fragments — avoids re-opening the dataset per fragment.
+   * multiple fragments — avoids re-opening the dataset per fragment AND skips opening at all when
+   * every fragment is served from the executor disk cache.
    */
   public static LanceFragmentScanner create(
-      int fragmentId, LanceInputPartition inputPartition, Dataset sharedDataset) {
-    if (sharedDataset == null) {
-      return createInternal(fragmentId, inputPartition, null);
+      int fragmentId,
+      LanceInputPartition inputPartition,
+      LazyResource<Dataset> sharedDatasetSupplier) {
+    if (sharedDatasetSupplier == null) {
+      return create(fragmentId, inputPartition);
     }
-    return createInternal(fragmentId, inputPartition, sharedDataset);
-  }
-
-  private static LanceFragmentScanner createInternal(
-      int fragmentId, LanceInputPartition inputPartition, Dataset sharedDataset) {
-    Dataset dataset = sharedDataset;
-    boolean datasetExternallyOwned = sharedDataset != null;
-    LanceScanner lanceScanner = null;
-    long dsOpenTimeNs = 0L;
-    try {
-      LanceSparkReadOptions readOptions = inputPartition.getReadOptions();
-      // Optionally rebuild the namespace client on the executor so the dataset open routes through
-      // Utils.OpenDatasetBuilder's namespaceClient branch. This preserves the storage options
-      // provider on the Rust side, which refreshes short-lived vended credentials (e.g. STS
-      // tokens) during long-running scans. The price is an eager describeTable() RPC against the
-      // namespace on every fragment open.
-      //
-      // For catalogs whose backing service authenticates per-call (e.g. Hive Metastore over
-      // Kerberos) executors typically lack a TGT and that RPC fails with "GSS initiate failed".
-      // Setting LanceSparkReadOptions.CONFIG_EXECUTOR_CREDENTIAL_REFRESH=false makes executors
-      // skip the rebuild and open the dataset by URI using the initialStorageOptions the driver
-      // already obtained, at the cost of losing the Rust-side credential refresh callback.
-      if (inputPartition.getNamespaceImpl() != null && readOptions.isExecutorCredentialRefresh()) {
-        if (LanceRuntime.useNamespaceOnWorkers(inputPartition.getNamespaceImpl())) {
-          readOptions.setNamespace(
-              LanceRuntime.getOrCreateNamespace(
-                  inputPartition.getNamespaceImpl(), inputPartition.getNamespaceProperties()));
-        } else {
-          readOptions.setNamespace(null);
-        }
-      }
-      if (dataset == null) {
-        long dsOpenStart = System.nanoTime();
-        dataset =
-            Utils.openDatasetBuilder(readOptions)
-                .initialStorageOptions(inputPartition.getInitialStorageOptions())
-                .build();
-        dsOpenTimeNs = System.nanoTime() - dsOpenStart;
-      }
-      Fragment fragment = dataset.getFragment(fragmentId);
-      if (fragment == null) {
-        throw new IllegalStateException(
-            String.format(
-                "Fragment %d not found in dataset at %s (version=%s)",
-                fragmentId, readOptions.getDatasetUri(), readOptions.getVersion()));
-      }
-      ScanOptions.Builder scanOptions = new ScanOptions.Builder();
-      List<String> projectedColumns = getColumnNames(inputPartition.getSchema());
-      if (projectedColumns.isEmpty() && inputPartition.getSchema().isEmpty()) {
-        // Lance requires at least one projected column. Use _rowid as a lightweight
-        // sentinel so the scanner still returns the correct row count (e.g. SELECT 1).
-        // Only do this when the schema is truly empty; when the schema contains virtual
-        // columns (e.g. _fragid, blob position/size) that are not passed to the scanner
-        // but added later by the batch scanner, adding _rowid here would shift column
-        // indices and cause Spark to read wrong data.
-        scanOptions.withRowId(true);
-      }
-      scanOptions.columns(projectedColumns);
-      if (inputPartition.getWhereCondition().isPresent()) {
-        scanOptions.filter(inputPartition.getWhereCondition().get());
-      }
-      scanOptions.batchSize(readOptions.getBatchSize());
-      if (readOptions.getNearest() != null) {
-        scanOptions.nearest(readOptions.getNearest());
-        // We strictly set `prefilter = true` here to ensure query correctness.
-        // This is necessary due to the combination of two factors:
-        // 1. Spark currently performs the vector search by individually scanning each fragment.
-        // 2. Lance mandates that `prefilter` must be enabled for fragmented vector queries.
-        // If Spark's execution model or Lance's search functionality changes in the future,
-        // we need to revisit this.
-        scanOptions.prefilter(true);
-      }
-      if (inputPartition.getLimit().isPresent()) {
-        scanOptions.limit(inputPartition.getLimit().get());
-      }
-      if (inputPartition.getOffset().isPresent()) {
-        scanOptions.offset(inputPartition.getOffset().get());
-      }
-      if (inputPartition.getTopNSortOrders().isPresent()) {
-        scanOptions.setColumnOrderings(inputPartition.getTopNSortOrders().get());
-      }
-      boolean withFragmentId =
-          inputPartition.getSchema().getFieldIndex(LanceConstant.FRAGMENT_ID).nonEmpty();
-      return new LanceFragmentScanner(
-          dataset,
-          fragment.newScan(scanOptions.build()),
-          fragmentId,
-          withFragmentId,
-          inputPartition,
-          datasetExternallyOwned);
-    } catch (Throwable throwable) {
-      if (lanceScanner != null) {
-        try {
-          lanceScanner.close();
-        } catch (Throwable closeError) {
-          throwable.addSuppressed(closeError);
-        }
-      }
-      // Only close the dataset if WE opened it in this call.
-      if (dataset != null && !datasetExternallyOwned) {
-        try {
-          dataset.close();
-        } catch (Throwable closeError) {
-          throwable.addSuppressed(closeError);
-        }
-      }
-      throw new RuntimeException(throwable);
-    }
+    return buildScanner(
+        fragmentId, inputPartition, sharedDatasetSupplier, /* externallyOwned= */ true);
   }
 
   /**
-   * @return the arrow reader. The caller is responsible for closing the reader
+   * Test-only factory: lets a test inject counting suppliers so it can assert the cache-hit short
+   * circuit never invokes them.
+   */
+  static LanceFragmentScanner createForTest(
+      int fragmentId,
+      LanceInputPartition inputPartition,
+      LazyResource<Dataset> datasetSupplier,
+      LazyResource<LanceScanner> scannerSupplier) {
+    boolean withFragmentId =
+        inputPartition.getSchema().getFieldIndex(LanceConstant.FRAGMENT_ID).nonEmpty();
+    return new LanceFragmentScanner(
+        datasetSupplier,
+        scannerSupplier,
+        fragmentId,
+        withFragmentId,
+        inputPartition,
+        /* datasetExternallyOwned= */ false);
+  }
+
+  private static LanceFragmentScanner buildScanner(
+      int fragmentId,
+      LanceInputPartition inputPartition,
+      LazyResource<Dataset> datasetSupplier,
+      boolean externallyOwned) {
+    boolean withFragmentId =
+        inputPartition.getSchema().getFieldIndex(LanceConstant.FRAGMENT_ID).nonEmpty();
+    LazyResource<LanceScanner> scannerSupplier =
+        new LazyResource<>(() -> buildLanceScanner(fragmentId, inputPartition, datasetSupplier));
+    return new LanceFragmentScanner(
+        datasetSupplier,
+        scannerSupplier,
+        fragmentId,
+        withFragmentId,
+        inputPartition,
+        externallyOwned);
+  }
+
+  private static Dataset openDataset(LanceInputPartition inputPartition) {
+    LanceSparkReadOptions readOptions = inputPartition.getReadOptions();
+    // Optionally rebuild the namespace client on the executor so the dataset open routes through
+    // Utils.OpenDatasetBuilder's namespaceClient branch. Preserves the storage options provider on
+    // the Rust side, which refreshes short-lived vended credentials (e.g. STS tokens) during
+    // long-running scans. The price is an eager describeTable() RPC against the namespace on
+    // every fragment open.
+    //
+    // For catalogs whose backing service authenticates per-call (e.g. Hive Metastore over
+    // Kerberos) executors typically lack a TGT and that RPC fails with "GSS initiate failed".
+    // Setting LanceSparkReadOptions.CONFIG_EXECUTOR_CREDENTIAL_REFRESH=false makes executors skip
+    // the rebuild and open the dataset by URI using the initialStorageOptions the driver already
+    // obtained, at the cost of losing the Rust-side credential refresh callback.
+    if (inputPartition.getNamespaceImpl() != null && readOptions.isExecutorCredentialRefresh()) {
+      if (LanceRuntime.useNamespaceOnWorkers(inputPartition.getNamespaceImpl())) {
+        readOptions.setNamespace(
+            LanceRuntime.getOrCreateNamespace(
+                inputPartition.getNamespaceImpl(), inputPartition.getNamespaceProperties()));
+      } else {
+        readOptions.setNamespace(null);
+      }
+    }
+    return Utils.openDatasetBuilder(readOptions)
+        .initialStorageOptions(inputPartition.getInitialStorageOptions())
+        .build();
+  }
+
+  private static LanceScanner buildLanceScanner(
+      int fragmentId, LanceInputPartition inputPartition, LazyResource<Dataset> datasetSupplier) {
+    Dataset dataset = datasetSupplier.get();
+    Fragment fragment = dataset.getFragment(fragmentId);
+    LanceSparkReadOptions readOptions = inputPartition.getReadOptions();
+    if (fragment == null) {
+      throw new IllegalStateException(
+          String.format(
+              "Fragment %d not found in dataset at %s (version=%s)",
+              fragmentId, readOptions.getDatasetUri(), readOptions.getVersion()));
+    }
+    ScanOptions.Builder scanOptions = new ScanOptions.Builder();
+    List<String> projectedColumns = getColumnNames(inputPartition.getSchema());
+    if (projectedColumns.isEmpty() && inputPartition.getSchema().isEmpty()) {
+      // Lance requires at least one projected column. Use _rowid as a lightweight sentinel so the
+      // scanner still returns the correct row count (e.g. SELECT 1). Only do this when the schema
+      // is truly empty; when the schema contains virtual columns (e.g. _fragid, blob position/
+      // size) that are not passed to the scanner but added later by the batch scanner, adding
+      // _rowid here would shift column indices and cause Spark to read wrong data.
+      scanOptions.withRowId(true);
+    }
+    scanOptions.columns(projectedColumns);
+    if (inputPartition.getWhereCondition().isPresent()) {
+      scanOptions.filter(inputPartition.getWhereCondition().get());
+    }
+    scanOptions.batchSize(readOptions.getBatchSize());
+    if (readOptions.getNearest() != null) {
+      scanOptions.nearest(readOptions.getNearest());
+      // We strictly set `prefilter = true` here to ensure query correctness:
+      // 1. Spark currently performs the vector search by individually scanning each fragment.
+      // 2. Lance mandates that `prefilter` must be enabled for fragmented vector queries.
+      scanOptions.prefilter(true);
+    }
+    if (inputPartition.getLimit().isPresent()) {
+      scanOptions.limit(inputPartition.getLimit().get());
+    }
+    if (inputPartition.getOffset().isPresent()) {
+      scanOptions.offset(inputPartition.getOffset().get());
+    }
+    if (inputPartition.getTopNSortOrders().isPresent()) {
+      scanOptions.setColumnOrderings(inputPartition.getTopNSortOrders().get());
+    }
+    return fragment.newScan(scanOptions.build());
+  }
+
+  /**
+   * @return the arrow reader. The caller is responsible for closing the reader.
    */
   public ArrowReader getArrowReader() {
-
     LanceSparkReadOptions readOptions = inputPartition.getReadOptions();
     BufferAllocator allocator = LanceRuntime.allocator();
 
-    ArrowReader reader;
     boolean useExecutorCache = LanceExecutorCache.isEnabled() && readOptions.getVersion() != null;
     if (useExecutorCache) {
       LanceExecutorCacheKey execKey = buildExecutorCacheKey(readOptions);
-      java.util.List<String> projectedCols = getColumnNames(inputPartition.getSchema());
+      List<String> projectedCols = getColumnNames(inputPartition.getSchema());
       try {
-        reader =
-            LanceExecutorCache.getInstance()
-                .getOrLoadColumns(
-                    execKey, projectedCols, allocator, missCols -> scanner.scanBatches());
+        return LanceExecutorCache.getInstance()
+            .getOrLoadColumns(
+                execKey, projectedCols, allocator, missCols -> scannerSupplier.get().scanBatches());
       } catch (IOException e) {
         throw new RuntimeException("load Lance fragment from executor disk cache", e);
       }
-    } else {
-      reader = scanner.scanBatches();
-      int queueDepth = inputPartition.getReadOptions().getBatchPrefetchQueueDepth();
-      if (queueDepth <= 0) {
-        return reader;
-      }
-      // Evaluate LanceRuntime.allocator() BEFORE calling the wrapper ctor so we can
-      // defend against a throw here: first-call-per-JVM lazily constructs a RootAllocator
-      // and can surface IllegalArgumentException from getAllocatorSize() or OOME from the
-      // allocator itself. Any throw before ownership transfers into the ctor leaves `reader`
-      // orphaned (Lance's native ArrowReader holds JNI buffers not reclaimed by GC), so we
-      // must close it here. Wrapping this call in its own try guarantees we only close on
-      // PRE-ownership failures — once the wrapper ctor starts, it owns the delegate and
-      // handles cleanup on its own throw paths (see PrefetchingArrowReader ctor), so a
-      // double-close on a non-idempotent JNI reader is avoided.
-      BufferAllocator parent;
-      try {
-        parent = LanceRuntime.allocator();
-      } catch (RuntimeException | Error e) {
-        try {
-          reader.close();
-        } catch (Exception closeEx) {
-          e.addSuppressed(closeEx);
-        }
-        throw e;
-      }
-      // PrefetchingArrowReader's ctor takes ownership of `reader` and closes it on any
-      // post-ownership failure (schema read, child allocator / empty root creation, thread
-      // start). We therefore must NOT also close `reader` here — Lance's native ArrowReader
-      // is not idempotent under close(), and a second close on a JNI-backed reader can
-      // SIGSEGV on double-free of native buffers.
-      reader = new PrefetchingArrowReader(reader, queueDepth, parent);
     }
-    return reader;
+
+    LanceScanner scanner = scannerSupplier.get();
+    ArrowReader reader = scanner.scanBatches();
+    int queueDepth = inputPartition.getReadOptions().getBatchPrefetchQueueDepth();
+    if (queueDepth <= 0) {
+      return reader;
+    }
+    BufferAllocator parent;
+    try {
+      parent = LanceRuntime.allocator();
+    } catch (RuntimeException | Error e) {
+      try {
+        reader.close();
+      } catch (Exception closeEx) {
+        e.addSuppressed(closeEx);
+      }
+      throw e;
+    }
+    return new PrefetchingArrowReader(reader, queueDepth, parent);
   }
 
   /**
@@ -274,6 +268,7 @@ public class LanceFragmentScanner implements AutoCloseable {
   @Override
   public void close() throws IOException {
     Throwable primary = null;
+    LanceScanner scanner = scannerSupplier.getIfInitialized();
     if (scanner != null) {
       try {
         scanner.close();
@@ -281,14 +276,17 @@ public class LanceFragmentScanner implements AutoCloseable {
         primary = t;
       }
     }
-    if (dataset != null && !datasetExternallyOwned) {
-      try {
-        dataset.close();
-      } catch (Throwable t) {
-        if (primary != null) {
-          primary.addSuppressed(t);
-        } else {
-          primary = t;
+    if (!datasetExternallyOwned) {
+      Dataset dataset = datasetSupplier.getIfInitialized();
+      if (dataset != null) {
+        try {
+          dataset.close();
+        } catch (Throwable t) {
+          if (primary != null) {
+            primary.addSuppressed(t);
+          } else {
+            primary = t;
+          }
         }
       }
     }
@@ -325,13 +323,10 @@ public class LanceFragmentScanner implements AutoCloseable {
    * columns) go through scanner.project() for consistent output ordering.
    */
   private static List<String> getColumnNames(StructType schema) {
-    // Collect all field names in the schema for quick lookup
     java.util.Set<String> schemaFields = new java.util.HashSet<>();
     for (StructField field : schema.fields()) {
       schemaFields.add(field.name());
     }
-
-    // Regular data columns (exclude all special/metadata columns)
     List<String> columns =
         Arrays.stream(schema.fields())
             .map(StructField::name)
@@ -345,8 +340,6 @@ public class LanceFragmentScanner implements AutoCloseable {
                         && !name.endsWith(LanceConstant.BLOB_POSITION_SUFFIX)
                         && !name.endsWith(LanceConstant.BLOB_SIZE_SUFFIX))
             .collect(Collectors.toList());
-
-    // Append special columns in METADATA_COLUMNS order (must match Rust scanner output order)
     if (schemaFields.contains(LanceConstant.ROW_ID)) {
       columns.add(LanceConstant.ROW_ID);
     }
@@ -359,7 +352,6 @@ public class LanceFragmentScanner implements AutoCloseable {
     if (schemaFields.contains(LanceConstant.ROW_CREATED_AT_VERSION)) {
       columns.add(LanceConstant.ROW_CREATED_AT_VERSION);
     }
-
     return columns;
   }
 }

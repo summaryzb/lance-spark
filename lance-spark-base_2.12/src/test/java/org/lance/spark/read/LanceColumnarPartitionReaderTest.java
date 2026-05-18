@@ -14,9 +14,11 @@
 package org.lance.spark.read;
 
 import org.lance.ipc.ColumnOrdering;
+import org.lance.spark.LanceSparkReadOptions;
 import org.lance.spark.TestUtils;
 import org.lance.spark.utils.Optional;
 
+import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 import org.junit.jupiter.api.Test;
 
@@ -155,5 +157,41 @@ public class LanceColumnarPartitionReaderTest {
         batch.close();
       }
     }
+  }
+
+  /**
+   * Locks down the lazy-shared-dataset contract: constructing the reader and closing it without
+   * ever calling {@code next()} must not open the shared dataset. We assert this by pointing at a
+   * non-existent URI; an eager open would throw inside {@code close()}.
+   */
+  @Test
+  public void closeWithoutNextDoesNotOpenSharedDataset() throws Exception {
+    LanceInputPartition partition = newPartitionPointingAtMissingDataset();
+    try (LanceColumnarPartitionReader reader = new LanceColumnarPartitionReader(partition)) {
+      // intentionally do not call next() — verifies lazy semantics
+    }
+  }
+
+  private LanceInputPartition newPartitionPointingAtMissingDataset() {
+    LanceSparkReadOptions readOptions =
+        LanceSparkReadOptions.builder()
+            .datasetUri("/tmp/lance-spark-no-such-dataset")
+            .version(1)
+            .build();
+    return new LanceInputPartition(
+        new StructType(),
+        0,
+        new LanceSplit(Collections.singletonList(0)),
+        readOptions,
+        Optional.empty(),
+        Optional.empty(),
+        Optional.empty(),
+        Optional.empty(),
+        Optional.empty(),
+        "lazy-test",
+        Collections.emptyMap(),
+        null,
+        null,
+        null);
   }
 }
