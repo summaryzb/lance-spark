@@ -363,16 +363,6 @@ public class LanceScanBuilder
     if (!readOptions.isPushDownFilters()) {
       return filters;
     }
-    // Pre-filter executor cache (V2): when the executor disk cache is enabled, skip all filter
-    // pushdown so each fragment scan returns raw projected columns. This is what lets the cache
-    // key drop the WHERE clause and share entries across queries with different predicates.
-    // Note: we cannot check readOptions.getVersion() here because version pinning happens later
-    // in getOrOpenDataset()/build(). The cache guard in LanceFragmentScanner.getArrowReader()
-    // does the full 3-way check at execution time.
-    if (org.lance.spark.internal.LanceExecutorCache.isEnabled()) {
-      pushedFilters = new Filter[0];
-      return filters;
-    }
     Filter[][] processFilters = FilterPushDown.processFilters(filters);
     pushedFilters = processFilters[0];
     return filters;

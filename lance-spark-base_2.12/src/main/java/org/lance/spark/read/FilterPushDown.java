@@ -48,7 +48,7 @@ public class FilterPushDown {
    * @return where clause, or Optional.empty() if filters do not exist
    */
   public static Optional<String> compileFiltersToSqlWhereClause(Filter[] filters) {
-    if (filters.length == 0) {
+    if (filters.length == 0 || org.lance.spark.internal.LanceExecutorCache.isEnabled()) {
       return Optional.empty();
     }
     List<String> compiledFilters = new ArrayList<>();

@@ -323,9 +323,7 @@ public class LanceScan
     // fragment per InputPartition so the emitted partition key matches a single value. Also
     // skipped when a TopN is pushed, because multi-fragment per-partition scans would break
     // Lance's per-scan ordering contract.
-    if (!org.lance.spark.internal.LanceExecutorCache.isEnabled()) {
-      prunedSplits = maybePackFragments(prunedSplits, planResult.getFragmentByteSizes());
-    }
+    prunedSplits = maybePackFragments(prunedSplits, planResult.getFragmentByteSizes());
     // Capture as effectively final for use in lambda
     final List<LanceSplit> finalSplits = prunedSplits;
 
