@@ -299,11 +299,6 @@ public class LanceScanBuilder
     // (when the projected schema is narrower than the full schema).
     long projectedRows = summary.getTotalRows();
     long projectedFullSize = summary.getTotalFilesSize();
-    if (survivingFragmentIds != null && summary.getTotalFragments() > 0) {
-      double ratio = (double) survivingFragmentIds.size() / summary.getTotalFragments();
-      projectedRows = (long) (projectedRows * ratio);
-      projectedFullSize = (long) (projectedFullSize * ratio);
-    }
     LanceStatistics statistics =
         CatalogColumnStatAdapter.estimateProjected(
             projectedRows, projectedFullSize, fullSchema, tableProperties);
