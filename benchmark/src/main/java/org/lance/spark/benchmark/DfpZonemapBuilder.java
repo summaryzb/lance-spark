@@ -35,20 +35,9 @@ public class DfpZonemapBuilder {
 
   private static final String[][] ZONEMAPS = {
       {"store_sales", "ss_sold_date_sk"},
-      {"store_sales", "ss_item_sk"},
-      {"store_sales", "ss_store_sk"},
-      {"store_sales", "ss_customer_sk"},
-      {"store_sales", "ss_addr_sk"},
       {"catalog_sales", "cs_sold_date_sk"},
-      {"catalog_sales", "cs_item_sk"},
-      {"catalog_sales", "cs_bill_customer_sk"},
       {"web_sales", "ws_sold_date_sk"},
-      {"web_sales", "ws_item_sk"},
-      {"web_sales", "ws_bill_customer_sk"},
-      {"web_sales", "ws_web_site_sk"},
       {"inventory", "inv_date_sk"},
-      {"inventory", "inv_item_sk"},
-      {"inventory", "inv_warehouse_sk"},
   };
 
   public static void main(String[] args) {
