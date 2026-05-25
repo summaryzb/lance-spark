@@ -539,6 +539,9 @@ public class LanceScan
     if (topNSortOrders.isPresent()) {
       return allSplits;
     }
+    if (org.lance.spark.internal.LanceExecutorCache.isEnabled()) {
+      return allSplits;
+    }
 
     SparkSession session;
     try {
